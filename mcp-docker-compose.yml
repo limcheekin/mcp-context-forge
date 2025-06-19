@@ -72,12 +72,7 @@ services:
     environment:
       - MCP_PORT=8000
       - MCP_HOST=0.0.0.0
-      - POSTGRES_HOST=${POSTGRES_HOST}
-      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_SSL_MODE=${POSTGRES_SSL_MODE:-prefer}
+      - POSTGRES_URL=${POSTGRES_URL:-postgresql://postgres:password@postgres:5432/mcp}
       - LOG_LEVEL=INFO
       - CONNECTION_POOL_SIZE=${POSTGRES_POOL_SIZE:-10}
       - CONNECTION_TIMEOUT=${POSTGRES_TIMEOUT:-30}
@@ -107,8 +102,9 @@ services:
     ports:
       - "9004:8000"
     environment:
-      - MCP_PORT=8000
-      - MCP_HOST=0.0.0.0
+      - TRANSPORT=sse
+      - HOST=0.0.0.0
+      - PORT=8000
       - GITHUB_TOKEN=${GITHUB_TOKEN}           # must-have for GitHub access
       - GITHUB_API_URL=https://api.github.com  # default URL, safe to leave
       - LOG_LEVEL=INFO
@@ -153,6 +149,11 @@ services:
       - ENABLE_WRITE=true
       - ENABLE_DELETE=false
       - MAX_DIRECTORY_DEPTH=10
+    command:
+      - "mcp-server-filesystem"
+      - "/mcp/data"
+      - "/mcp/uploads"
+      - "/mcp/temp" 
     volumes:
       - ./data:/mcp/data
       - ./uploads:/mcp/uploads
@@ -181,8 +182,9 @@ services:
     ports:
       - "9006:8000"
     environment:
-      - MCP_PORT=8000
-      - MCP_HOST=0.0.0.0
+      - TRANSPORT=sse
+      - HOST=0.0.0.0
+      - PORT=8000
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
       - MEMORY_TTL=3600
       - MAX_MEMORY_SIZE=1GB
