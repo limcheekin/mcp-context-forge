@@ -109,14 +109,16 @@ services:
     environment:
       - MCP_PORT=8000
       - MCP_HOST=0.0.0.0
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
-      - GITHUB_API_URL=https://api.github.com
-      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}           # must-have for GitHub access
+      - GITHUB_API_URL=https://api.github.com  # default URL, safe to leave
       - LOG_LEVEL=INFO
-      - RATE_LIMIT_REQUESTS=5000
+      - RATE_LIMIT_REQUESTS=5000               # optional limits
       - RATE_LIMIT_WINDOW=3600
       - MAX_FILE_SIZE=10MB
-      - ALLOWED_ORGANIZATIONS=${GITHUB_ALLOWED_ORGS}
+      # (Optional)
+      # - GITHUB_TOOLSETS=${GITHUB_TOOLSETS}
+      # - GITHUB_READ_ONLY=${GITHUB_READ_ONLY:-false}
+      # - GITHUB_HOST=${GITHUB_HOST}
     volumes:
       - ./github/cache:/app/cache
       - ./github/logs:/app/logs
