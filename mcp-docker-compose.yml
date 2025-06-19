@@ -2,16 +2,16 @@ version: '3.9'
 
 services:
   mcp_time:
-    image: mcp/time:latest
+    image: supercorp/supergateway:uvx
     container_name: mcp_time
     restart: unless-stopped
     ports:
-      - "9001:8000"
-    environment:
-      - MCP_PORT=8000
-      - MCP_HOST=0.0.0.0
-      - TIMEZONE=${TIMEZONE:-UTC}
-      - LOG_LEVEL=INFO
+      - "9007:8000"
+    stdin_open: true
+    tty: true
+    command: ["--stdio", "uvx mcp-server-time", 
+              "--local-timezone=Asia/Kuala_Lumpur", 
+              "--healthEndpoint", "/health"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -26,7 +26,6 @@ services:
         reservations:
           memory: 64M
           cpus: '0.1'
-
   mcp_playwright:
     image: mcp/playwright:latest
     container_name: mcp_playwright
@@ -99,88 +98,7 @@ services:
         reservations:
           memory: 128M
           cpus: '0.2'
-
-  mcp_github:
-    image: mcp/github-mcp-server:latest
-    container_name: mcp_github
-    restart: unless-stopped
-    ports:
-      - "9004:8000"
-    environment:
-      - MCP_PORT=8000
-      - MCP_HOST=0.0.0.0
-      - GITHUB_TOKEN=${GITHUB_TOKEN}           # must-have for GitHub access
-      - GITHUB_API_URL=https://api.github.com  # default URL, safe to leave
-      - LOG_LEVEL=INFO
-      - RATE_LIMIT_REQUESTS=5000               # optional limits
-      - RATE_LIMIT_WINDOW=3600
-      - MAX_FILE_SIZE=10MB
-      # (Optional)
-      # - GITHUB_TOOLSETS=${GITHUB_TOOLSETS}
-      # - GITHUB_READ_ONLY=${GITHUB_READ_ONLY:-false}
-      # - GITHUB_HOST=${GITHUB_HOST}
-    volumes:
-      - ./github/cache:/app/cache
-      - ./github/logs:/app/logs
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-          cpus: '0.5'
-        reservations:
-          memory: 256M
-          cpus: '0.2'
-
-  github_mcp:
-    image: ghcr.io/github/github-mcp-server:latest
-    container_name: github_mcp
-    restart: unless-stopped
-    
-    # Environment variables based on official documentation
-    environment:
-      # Required: GitHub Personal Access Token
-      - GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_PERSONAL_ACCESS_TOKEN}
-      
-      # Optional: Toolsets to enable (comma-separated)
-      # Available: repos,issues,users,pull_requests,code_security,experiments
-      - GITHUB_TOOLSETS=${GITHUB_TOOLSETS:-all}
-      
-      # Optional: Enable dynamic toolset discovery
-      - GITHUB_DYNAMIC_TOOLSETS=${GITHUB_DYNAMIC_TOOLSETS:-0}
-      
-      # Optional: GitHub Enterprise Server hostname
-      - GITHUB_HOST=${GITHUB_HOST:-}
-      
-      # Optional: Tool description overrides
-      - GITHUB_MCP_TOOL_ADD_ISSUE_COMMENT_DESCRIPTION=${TOOL_ADD_ISSUE_COMMENT_DESCRIPTION:-}
-      - GITHUB_MCP_TOOL_CREATE_BRANCH_DESCRIPTION=${TOOL_CREATE_BRANCH_DESCRIPTION:-}
-    
-    # The server runs in stdio mode for MCP communication
-    # No ports are exposed as this is not a HTTP server
-    stdin_open: true
-    tty: true
-    
-    # Optional: Mount configuration directory for tool descriptions
-    volumes:
-      - ./config:/app/config:ro
-      - ./logs:/app/logs
-    
-    # Resource limits
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: '0.25'
-        reservations:
-          memory: 128M
-          cpus: '0.1'          
-
+  
   mcp_filesystem:
     image: mcp/filesystem:latest
     container_name: mcp_filesystem
