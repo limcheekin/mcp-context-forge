@@ -6,7 +6,7 @@ services:
     container_name: mcp_time
     restart: unless-stopped
     ports:
-      - "9007:8000"
+      - "9001:8000"
     stdin_open: true
     tty: true
     command: ["--stdio", "uvx mcp-server-time", 
