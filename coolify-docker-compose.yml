@@ -111,30 +111,30 @@ services:
 ###############################################################################
 #  OPTIONAL MCP SERVERS – drop-in helpers the Gateway can call
 # ###############################################################################
-#   mcp_time:
-#     image: mcp/time:latest
-#
-#   mcp_playwright:
-#     image: mcp/playwright:latest
-#
-#   mcp_postgres:
-#     image: mcp/postgres:latest
-#
-#   mcp_github:
-#     image: mcp/github:latest
-#
-#   mcp_filesystem:
-#     image: mcp/filesystem:latest
-#
-#   mcp_perplexity_ask:
-#     image: mcp/perplexity-ask:latest
-#
-#   mcp_memory:
-#     image: mcp/memory:latest
-#
-#   mcp_fetch:
-#     image: mcp/fetch:latest
-#
+  mcp_time:
+    image: mcp/time:latest
+
+  mcp_playwright:
+    image: mcp/playwright:latest
+
+  mcp_postgres:
+    image: mcp/postgres:latest
+
+  mcp_github:
+    image: mcp/github:latest
+
+  mcp_filesystem:
+    image: mcp/filesystem:latest
+
+  mcp_perplexity_ask:
+    image: mcp/perplexity-ask:latest
+
+  mcp_memory:
+    image: mcp/memory:latest
+
+  mcp_fetch:
+    image: mcp/fetch:latest
+
 # Create user/pass in postgres
 # CREATE ROLE mcp WITH LOGIN PASSWORD 'your_secure_password';
 # CREATE DATABASE mcp OWNER mcp;
