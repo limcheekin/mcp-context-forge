@@ -1,0 +1,252 @@
+version: '3.9'
+
+services:
+  mcp_time:
+    image: mcp/time:latest
+    container_name: mcp_time
+    restart: unless-stopped
+    ports:
+      - "9001:8000"
+    environment:
+      - MCP_PORT=8000
+      - MCP_HOST=0.0.0.0
+      - TIMEZONE=${TIMEZONE:-UTC}
+      - LOG_LEVEL=INFO
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.25'
+        reservations:
+          memory: 64M
+          cpus: '0.1'
+
+  mcp_playwright:
+    image: mcp/playwright:latest
+    container_name: mcp_playwright
+    restart: unless-stopped
+    ports:
+      - "9002:8000"
+    environment:
+      - MCP_PORT=8000
+      - MCP_HOST=0.0.0.0
+      - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+      - DISPLAY=:99
+      - LOG_LEVEL=INFO
+      - MAX_CONCURRENT_SESSIONS=5
+      - SESSION_TIMEOUT=300000
+      - BROWSER_TIMEOUT=30000
+    volumes:
+      - playwright_data:/ms-playwright
+      - ./screenshots:/app/screenshots
+      - ./downloads:/app/downloads
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+    security_opt:
+      - seccomp:unconfined
+
+  mcp_postgres:
+    image: mcp/postgres:latest
+    container_name: mcp_postgres
+    restart: unless-stopped
+    ports:
+      - "9003:8000"
+    environment:
+      - MCP_PORT=8000
+      - MCP_HOST=0.0.0.0
+      - POSTGRES_HOST=${POSTGRES_HOST}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_SSL_MODE=${POSTGRES_SSL_MODE:-prefer}
+      - LOG_LEVEL=INFO
+      - CONNECTION_POOL_SIZE=${POSTGRES_POOL_SIZE:-10}
+      - CONNECTION_TIMEOUT=${POSTGRES_TIMEOUT:-30}
+      - QUERY_TIMEOUT=${POSTGRES_QUERY_TIMEOUT:-60}
+    volumes:
+      - ./postgres/logs:/app/logs
+      - ./postgres/cache:/app/cache
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+        reservations:
+          memory: 128M
+          cpus: '0.2'
+
+  mcp_github:
+    image: mcp/github:latest
+    container_name: mcp_github
+    restart: unless-stopped
+    ports:
+      - "9004:8000"
+    environment:
+      - MCP_PORT=8000
+      - MCP_HOST=0.0.0.0
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_API_URL=https://api.github.com
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      - LOG_LEVEL=INFO
+      - RATE_LIMIT_REQUESTS=5000
+      - RATE_LIMIT_WINDOW=3600
+      - MAX_FILE_SIZE=10MB
+      - ALLOWED_ORGANIZATIONS=${GITHUB_ALLOWED_ORGS}
+    volumes:
+      - ./github/cache:/app/cache
+      - ./github/logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.2'
+
+  mcp_filesystem:
+    image: mcp/filesystem:latest
+    container_name: mcp_filesystem
+    restart: unless-stopped
+    ports:
+      - "9005:8000"
+    environment:
+      - MCP_PORT=8000
+      - MCP_HOST=0.0.0.0
+      - FILESYSTEM_ROOT=/mcp/data
+      - MAX_FILE_SIZE=100MB
+      - ALLOWED_EXTENSIONS=.txt,.json,.yaml,.yml,.md,.csv,.log
+      - LOG_LEVEL=INFO
+      - ENABLE_WRITE=true
+      - ENABLE_DELETE=false
+      - MAX_DIRECTORY_DEPTH=10
+    volumes:
+      - ./data:/mcp/data
+      - ./uploads:/mcp/uploads
+      - ./temp:/mcp/temp
+      - filesystem_logs:/var/log/mcp
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.3'
+        reservations:
+          memory: 128M
+          cpus: '0.1'
+    user: "1000:1000"
+
+  mcp_memory:
+    image: mcp/memory:latest
+    container_name: mcp_memory
+    restart: unless-stopped
+    ports:
+      - "9006:8000"
+    environment:
+      - MCP_PORT=8000
+      - MCP_HOST=0.0.0.0
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - MEMORY_TTL=3600
+      - MAX_MEMORY_SIZE=1GB
+      - LOG_LEVEL=INFO
+      - COMPRESSION_ENABLED=true
+      - PERSISTENCE_ENABLED=true
+      - CLEANUP_INTERVAL=300
+    volumes:
+      - memory_data:/app/data
+      - ./memory/logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+          cpus: '0.5'
+        reservations:
+          memory: 512M
+          cpus: '0.2'
+
+  mcp_fetch:
+    image: mcp/fetch:latest
+    container_name: mcp_fetch
+    restart: unless-stopped
+    ports:
+      - "9007:8000"
+    environment:
+      - MCP_PORT=8000
+      - MCP_HOST=0.0.0.0
+      - LOG_LEVEL=INFO
+      - MAX_CONCURRENT_REQUESTS=10
+      - REQUEST_TIMEOUT=30
+      - MAX_RESPONSE_SIZE=50MB
+      - ALLOWED_DOMAINS=${FETCH_ALLOWED_DOMAINS}
+      - USER_AGENT=MCP-Fetch/1.0
+      - FOLLOW_REDIRECTS=true
+      - MAX_REDIRECTS=5
+      - ENABLE_CACHING=true
+      - CACHE_TTL=300
+    volumes:
+      - ./fetch/cache:/app/cache
+      - ./fetch/logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.4'
+        reservations:
+          memory: 256M
+          cpus: '0.1'
+
+volumes:
+  playwright_data:
+    driver: local
+  memory_data:
+    driver: local
+  filesystem_logs:
+    driver: local
