@@ -266,7 +266,7 @@ services:
       - "9007:8000"
     stdin_open: true
     tty: true
-    command: ["--stdio", "uvx mcp-server-fetch"]
+    command: ["--stdio", "uvx mcp-server-fetch", "--healthEndpoint", "/health"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
