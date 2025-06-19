@@ -77,6 +77,11 @@ services:
       - CONNECTION_POOL_SIZE=${POSTGRES_POOL_SIZE:-10}
       - CONNECTION_TIMEOUT=${POSTGRES_TIMEOUT:-30}
       - QUERY_TIMEOUT=${POSTGRES_QUERY_TIMEOUT:-60}
+    command:
+      - "mcp-server-filesystem"
+      - "/mcp/data"
+      - "/mcp/uploads"
+      - "/mcp/temp" 
     volumes:
       - ./postgres/logs:/app/logs
       - ./postgres/cache:/app/cache
@@ -96,15 +101,14 @@ services:
           cpus: '0.2'
 
   mcp_github:
-    image: mcp/github:latest
+    image: mcp/github-mcp-server:latest
     container_name: mcp_github
     restart: unless-stopped
     ports:
       - "9004:8000"
     environment:
-      - TRANSPORT=sse
-      - HOST=0.0.0.0
-      - PORT=8000
+      - MCP_PORT=8000
+      - MCP_HOST=0.0.0.0
       - GITHUB_TOKEN=${GITHUB_TOKEN}           # must-have for GitHub access
       - GITHUB_API_URL=https://api.github.com  # default URL, safe to leave
       - LOG_LEVEL=INFO
@@ -132,6 +136,50 @@ services:
         reservations:
           memory: 256M
           cpus: '0.2'
+
+  github_mcp:
+    image: ghcr.io/github/github-mcp-server:latest
+    container_name: github_mcp
+    restart: unless-stopped
+    
+    # Environment variables based on official documentation
+    environment:
+      # Required: GitHub Personal Access Token
+      - GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_PERSONAL_ACCESS_TOKEN}
+      
+      # Optional: Toolsets to enable (comma-separated)
+      # Available: repos,issues,users,pull_requests,code_security,experiments
+      - GITHUB_TOOLSETS=${GITHUB_TOOLSETS:-all}
+      
+      # Optional: Enable dynamic toolset discovery
+      - GITHUB_DYNAMIC_TOOLSETS=${GITHUB_DYNAMIC_TOOLSETS:-0}
+      
+      # Optional: GitHub Enterprise Server hostname
+      - GITHUB_HOST=${GITHUB_HOST:-}
+      
+      # Optional: Tool description overrides
+      - GITHUB_MCP_TOOL_ADD_ISSUE_COMMENT_DESCRIPTION=${TOOL_ADD_ISSUE_COMMENT_DESCRIPTION:-}
+      - GITHUB_MCP_TOOL_CREATE_BRANCH_DESCRIPTION=${TOOL_CREATE_BRANCH_DESCRIPTION:-}
+    
+    # The server runs in stdio mode for MCP communication
+    # No ports are exposed as this is not a HTTP server
+    stdin_open: true
+    tty: true
+    
+    # Optional: Mount configuration directory for tool descriptions
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.25'
+        reservations:
+          memory: 128M
+          cpus: '0.1'          
 
   mcp_filesystem:
     image: mcp/filesystem:latest
@@ -211,27 +259,14 @@ services:
           cpus: '0.2'
 
   mcp_fetch:
-    image: mcp/fetch:latest
+    image: supercorp/supergateway:uvx
     container_name: mcp_fetch
     restart: unless-stopped
     ports:
       - "9007:8000"
-    environment:
-      - MCP_PORT=8000
-      - MCP_HOST=0.0.0.0
-      - LOG_LEVEL=INFO
-      - MAX_CONCURRENT_REQUESTS=10
-      - REQUEST_TIMEOUT=30
-      - MAX_RESPONSE_SIZE=50MB
-      - ALLOWED_DOMAINS=${FETCH_ALLOWED_DOMAINS}
-      - USER_AGENT=MCP-Fetch/1.0
-      - FOLLOW_REDIRECTS=true
-      - MAX_REDIRECTS=5
-      - ENABLE_CACHING=true
-      - CACHE_TTL=300
-    volumes:
-      - ./fetch/cache:/app/cache
-      - ./fetch/logs:/app/logs
+    stdin_open: true
+    tty: true
+    command: ["--stdio", "uvx mcp-server-fetch"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
