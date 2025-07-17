@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "general": {
+      "type": "sse",
+      "url": "http://192.168.1.111:4444/servers/206b18c1adf843a595fd49f07c940fd8/sse",
+      "headers": {
+        "Authorization": "Bearer token"
+      }
+    }
+  }
+}
