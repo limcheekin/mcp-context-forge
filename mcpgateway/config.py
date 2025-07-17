@@ -3,14 +3,14 @@
 
 Copyright 2025
 SPDX-License-Identifier: Apache-2.0
-Authors: Mihai Criveti
+Authors: Mihai Criveti, Manav Gupta
 
 This module defines configuration settings for the MCP Gateway using Pydantic.
 It loads configuration from environment variables with sensible defaults.
 
 Environment variables:
-- APP_NAME: Gateway name (default: "MCP Gateway")
-- HOST: Host to bind to (default: "0.0.0.0")
+- APP_NAME: Gateway name (default: "MCP_Gateway")
+- HOST: Host to bind to (default: "127.0.0.1")
 - PORT: Port to listen on (default: 4444)
 - DATABASE_URL: SQLite database URL (default: "sqlite:///./mcp.db")
 - BASIC_AUTH_USER: Admin username (default: "admin")
@@ -27,40 +27,82 @@ Environment variables:
 - TOOL_TIMEOUT: Tool invocation timeout (default: 60)
 - PROMPT_CACHE_SIZE: Max cached prompts (default: 100)
 - HEALTH_CHECK_INTERVAL: Gateway health check interval (default: 60)
+
+Examples:
+    >>> from mcpgateway.config import Settings
+    >>> s = Settings(basic_auth_user='admin', basic_auth_password='secret')
+    >>> s.api_key
+    'admin:secret'
+    >>> s2 = Settings(transport_type='http')
+    >>> s2.validate_transport()  # no error
+    >>> s3 = Settings(transport_type='invalid')
+    >>> try:
+    ...     s3.validate_transport()
+    ... except ValueError as e:
+    ...     print('error')
+    error
+    >>> s4 = Settings(database_url='sqlite:///./test.db')
+    >>> isinstance(s4.database_settings, dict)
+    True
 """
 
-import json
+# Standard
 from functools import lru_cache
 from importlib.resources import files
+import json
+import logging
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Optional, Set, Union
+import re
+from typing import Annotated, Any, ClassVar, Dict, List, Optional, Set, Union
 
-import jq
+# Third-Party
 from fastapi import HTTPException
+import jq
 from jsonpath_ng.ext import parse
 from jsonpath_ng.jsonpath import JSONPath
-from pydantic import Field, field_validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
-    """MCP Gateway configuration settings."""
+    """
+    MCP Gateway configuration settings.
+
+    Examples:
+        >>> from mcpgateway.config import Settings
+        >>> s = Settings(basic_auth_user='admin', basic_auth_password='secret')
+        >>> s.api_key
+        'admin:secret'
+        >>> s2 = Settings(transport_type='http')
+        >>> s2.validate_transport()  # no error
+        >>> s3 = Settings(transport_type='invalid')
+        >>> try:
+        ...     s3.validate_transport()
+        ... except ValueError as e:
+        ...     print('error')
+        error
+        >>> s4 = Settings(database_url='sqlite:///./test.db')
+        >>> isinstance(s4.database_settings, dict)
+        True
+    """
 
     # Basic Settings
-    app_name: str = Field("MCP Gateway", env="APP_NAME")
-    host: str = Field("127.0.0.1", env="HOST")
-    port: int = Field(4444, env="PORT")
+    app_name: str = "MCP_Gateway"
+    host: str = "127.0.0.1"
+    port: int = 4444
     database_url: str = "sqlite:///./mcp.db"
     templates_dir: Path = Path("mcpgateway/templates")
     # Absolute paths resolved at import-time (still override-able via env vars)
-    templates_dir: Path = Field(
-        default=files("mcpgateway") / "templates",
-        env="TEMPLATES_DIR",
-    )
-    static_dir: Path = Field(
-        default=files("mcpgateway") / "static",
-        env="STATIC_DIR",
-    )
+    templates_dir: Path = files("mcpgateway") / "templates"
+    static_dir: Path = files("mcpgateway") / "static"
     app_root_path: str = ""
 
     # Protocol
@@ -78,22 +120,58 @@ class Settings(BaseSettings):
     auth_encryption_secret: str = "my-test-salt"
 
     # UI/Admin Feature Flags
-    mcpgateway_ui_enabled: bool = True
-    mcpgateway_admin_api_enabled: bool = True
+    mcpgateway_ui_enabled: bool = False
+    mcpgateway_admin_api_enabled: bool = False
 
     # Security
     skip_ssl_verify: bool = False
+    cors_enabled: bool = True
 
     # For allowed_origins, strip '' to ensure we're passing on valid JSON via env
-    # Tell pydantic *not* to touch this env var – our validator will.
+    # Tell pydantic *not* to touch this env var - our validator will.
     allowed_origins: Annotated[Set[str], NoDecode] = {
         "http://localhost",
         "http://localhost:4444",
     }
 
+    # Max retries for HTTP requests
+    retry_max_attempts: int = 3
+    retry_base_delay: float = 1.0  # seconds
+    retry_max_delay: int = 60  # seconds
+    retry_jitter_max: float = 0.5  # fraction of base delay
+
     @field_validator("allowed_origins", mode="before")
     @classmethod
     def _parse_allowed_origins(cls, v):
+        """Parse allowed origins from environment variable or config value.
+
+        Handles multiple input formats for the allowed_origins field:
+        - JSON array string: '["http://localhost", "http://example.com"]'
+        - Comma-separated string: "http://localhost, http://example.com"
+        - Already parsed set/list
+
+        Automatically strips whitespace and removes outer quotes if present.
+
+        Args:
+            v: The input value to parse. Can be a string (JSON or CSV), set, list, or other iterable.
+
+        Returns:
+            Set[str]: A set of allowed origin strings.
+
+        Examples:
+            >>> sorted(Settings._parse_allowed_origins('["https://a.com", "https://b.com"]'))
+            ['https://a.com', 'https://b.com']
+            >>> sorted(Settings._parse_allowed_origins("https://x.com , https://y.com"))
+            ['https://x.com', 'https://y.com']
+            >>> Settings._parse_allowed_origins('""')
+            set()
+            >>> Settings._parse_allowed_origins('"https://single.com"')
+            {'https://single.com'}
+            >>> sorted(Settings._parse_allowed_origins(['http://a.com', 'http://b.com']))
+            ['http://a.com', 'http://b.com']
+            >>> Settings._parse_allowed_origins({'http://existing.com'})
+            {'http://existing.com'}
+        """
         if isinstance(v, str):
             v = v.strip()
             if v[:1] in "\"'" and v[-1:] == v[:1]:  # strip 1 outer quote pair
@@ -122,12 +200,39 @@ class Settings(BaseSettings):
     # For federation_peers strip out quotes to ensure we're passing valid JSON via env
     federation_peers: Annotated[List[str], NoDecode] = []
 
-    # Lock file path for initializing gateway service initialize
-    lock_file_path: str = "/tmp/gateway_init.done"
-
     @field_validator("federation_peers", mode="before")
     @classmethod
     def _parse_federation_peers(cls, v):
+        """Parse federation peer URLs from environment variable or config value.
+
+        Handles multiple input formats for the federation_peers field:
+        - JSON array string: '["https://gw1.com", "https://gw2.com"]'
+        - Comma-separated string: "https://gw1.com, https://gw2.com"
+        - Already parsed list
+
+        Automatically strips whitespace and removes outer quotes if present.
+        Order is preserved when parsing.
+
+        Args:
+            v: The input value to parse. Can be a string (JSON or CSV), list, or other iterable.
+
+        Returns:
+            List[str]: A list of federation peer URLs.
+
+        Examples:
+            >>> Settings._parse_federation_peers('["https://gw1", "https://gw2"]')
+            ['https://gw1', 'https://gw2']
+            >>> Settings._parse_federation_peers("https://gw3, https://gw4")
+            ['https://gw3', 'https://gw4']
+            >>> Settings._parse_federation_peers('""')
+            []
+            >>> Settings._parse_federation_peers('"https://single-peer.com"')
+            ['https://single-peer.com']
+            >>> Settings._parse_federation_peers(['http://p1.com', 'http://p2.com'])
+            ['http://p1.com', 'http://p2.com']
+            >>> Settings._parse_federation_peers([])
+            []
+        """
         if isinstance(v, str):
             v = v.strip()
             if v[:1] in "\"'" and v[-1:] == v[:1]:
@@ -171,9 +276,9 @@ class Settings(BaseSettings):
     # Health Checks
     health_check_interval: int = 60  # seconds
     health_check_timeout: int = 10  # seconds
-    unhealthy_threshold: int = 10
+    unhealthy_threshold: int = 5  # after this many failures, mark as Offline
 
-    filelock_path: str = "tmp/gateway_service_leader.lock"
+    filelock_name: str = "gateway_service_leader.lock"
 
     # Default Roots
     default_roots: List[str] = []
@@ -183,6 +288,8 @@ class Settings(BaseSettings):
     db_max_overflow: int = 10
     db_pool_timeout: int = 30
     db_pool_recycle: int = 3600
+    db_max_retries: int = 3
+    db_retry_interval_ms: int = 2000
 
     # Cache
     cache_type: str = "database"  # memory or redis or database
@@ -190,6 +297,8 @@ class Settings(BaseSettings):
     cache_prefix: str = "mcpgw:"
     session_ttl: int = 3600
     message_ttl: int = 600
+    redis_max_retries: int = 3
+    redis_retry_interval_ms: int = 2000
 
     # streamable http transport
     use_stateful_sessions: bool = False  # Set to False to use stateless sessions without event store
@@ -202,12 +311,44 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore")
 
+    gateway_tool_name_separator: str = "-"
+    valid_slug_separator_regexp: ClassVar[str] = r"^(-{1,2}|[_.])$"
+
+    @field_validator("gateway_tool_name_separator")
+    @classmethod
+    def must_be_allowed_sep(cls, v: str) -> str:
+        """Validate the gateway tool name separator.
+
+        Args:
+            v: The separator value to validate.
+
+        Returns:
+            The validated separator, defaults to '-' if invalid.
+        """
+        if not re.fullmatch(cls.valid_slug_separator_regexp, v):
+            logger.warning(
+                f"Invalid gateway_tool_name_separator '{v}'. Must be '-', '--', '_' or '.'. Defaulting to '-'.",
+                stacklevel=2,
+            )
+            return "-"
+        return v
+
     @property
     def api_key(self) -> str:
-        """Generate API key from auth credentials.
+        """
+        Generate API key from auth credentials.
 
         Returns:
             str: API key string in the format "username:password".
+
+        Examples:
+            >>> from mcpgateway.config import Settings
+            >>> settings = Settings(basic_auth_user="admin", basic_auth_password="secret")
+            >>> settings.api_key
+            'admin:secret'
+            >>> settings = Settings(basic_auth_user="user123", basic_auth_password="pass456")
+            >>> settings.api_key
+            'user123:pass456'
         """
         return f"{self.basic_auth_user}:{self.basic_auth_password}"
 
@@ -217,6 +358,17 @@ class Settings(BaseSettings):
 
         Returns:
             bool: True if HTTP transport is enabled, False otherwise.
+
+        Examples:
+            >>> settings = Settings(transport_type="http")
+            >>> settings.supports_http
+            True
+            >>> settings = Settings(transport_type="all")
+            >>> settings.supports_http
+            True
+            >>> settings = Settings(transport_type="ws")
+            >>> settings.supports_http
+            False
         """
         return self.transport_type in ["http", "all"]
 
@@ -226,6 +378,17 @@ class Settings(BaseSettings):
 
         Returns:
             bool: True if WebSocket transport is enabled, False otherwise.
+
+        Examples:
+            >>> settings = Settings(transport_type="ws")
+            >>> settings.supports_websocket
+            True
+            >>> settings = Settings(transport_type="all")
+            >>> settings.supports_websocket
+            True
+            >>> settings = Settings(transport_type="http")
+            >>> settings.supports_websocket
+            False
         """
         return self.transport_type in ["ws", "all"]
 
@@ -235,15 +398,33 @@ class Settings(BaseSettings):
 
         Returns:
             bool: True if SSE transport is enabled, False otherwise.
+
+        Examples:
+            >>> settings = Settings(transport_type="sse")
+            >>> settings.supports_sse
+            True
+            >>> settings = Settings(transport_type="all")
+            >>> settings.supports_sse
+            True
+            >>> settings = Settings(transport_type="http")
+            >>> settings.supports_sse
+            False
         """
         return self.transport_type in ["sse", "all"]
 
     @property
     def database_settings(self) -> dict:
-        """Get SQLAlchemy database settings.
+        """
+        Get SQLAlchemy database settings.
 
         Returns:
             dict: Dictionary containing SQLAlchemy database configuration options.
+
+        Examples:
+            >>> from mcpgateway.config import Settings
+            >>> s = Settings(database_url='sqlite:///./test.db')
+            >>> isinstance(s.database_settings, dict)
+            True
         """
         return {
             "pool_size": self.db_pool_size,
@@ -272,22 +453,81 @@ class Settings(BaseSettings):
         )
 
     def validate_transport(self) -> None:
-        """Validate transport configuration.
+        """
+        Validate transport configuration.
 
         Raises:
             ValueError: If the transport type is not one of the valid options.
+
+        Examples:
+            >>> from mcpgateway.config import Settings
+            >>> s = Settings(transport_type='http')
+            >>> s.validate_transport()  # no error
+            >>> s2 = Settings(transport_type='invalid')
+            >>> try:
+            ...     s2.validate_transport()
+            ... except ValueError as e:
+            ...     print('error')
+            error
         """
         valid_types = {"http", "ws", "sse", "all"}
         if self.transport_type not in valid_types:
             raise ValueError(f"Invalid transport type. Must be one of: {valid_types}")
 
     def validate_database(self) -> None:
-        """Validate database configuration."""
+        """Validate database configuration.
+
+        Examples:
+            >>> from mcpgateway.config import Settings
+            >>> s = Settings(database_url='sqlite:///./test.db')
+            >>> s.validate_database()  # Should create the directory if it does not exist
+        """
         if self.database_url.startswith("sqlite"):
             db_path = Path(self.database_url.replace("sqlite:///", ""))
             db_dir = db_path.parent
             if not db_dir.exists():
                 db_dir.mkdir(parents=True)
+
+    # Validation patterns for safe display (configurable)
+    validation_dangerous_html_pattern: str = r"<(script|iframe|object|embed|link|meta|base|form)\b|</*(script|iframe|object|embed|link|meta|base|form)>"
+    validation_dangerous_js_pattern: str = r"javascript:|vbscript:|on\w+\s*=|data:.*script"
+    validation_allowed_url_schemes: List[str] = ["http://", "https://", "ws://", "wss://"]
+
+    # Character validation patterns
+    validation_name_pattern: str = r"^[a-zA-Z0-9_.\-\s]+$"  # Allow spaces for names
+    validation_identifier_pattern: str = r"^[a-zA-Z0-9_\-\.]+$"  # No spaces for IDs
+    validation_safe_uri_pattern: str = r"^[a-zA-Z0-9_\-.:/?=&%]+$"
+    validation_unsafe_uri_pattern: str = r'[<>"\'\\]'
+    validation_tool_name_pattern: str = r"^[a-zA-Z][a-zA-Z0-9._-]*$"  # MCP tool naming
+
+    # MCP-compliant size limits (configurable via env)
+    validation_max_name_length: int = 255
+    validation_max_description_length: int = 4096
+    validation_max_template_length: int = 65536  # 64KB
+    validation_max_content_length: int = 1048576  # 1MB
+    validation_max_json_depth: int = 10
+    validation_max_url_length: int = 2048
+    validation_max_rpc_param_size: int = 262144  # 256KB
+
+    # Allowed MIME types
+    validation_allowed_mime_types: List[str] = [
+        "text/plain",
+        "text/html",
+        "text/css",
+        "text/markdown",
+        "text/javascript",
+        "application/json",
+        "application/xml",
+        "application/pdf",
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/svg+xml",
+        "application/octet-stream",
+    ]
+
+    # Rate limiting
+    validation_max_requests_per_minute: int = 60
 
 
 def extract_using_jq(data, jq_filter=""):
@@ -300,6 +540,18 @@ def extract_using_jq(data, jq_filter=""):
 
     Returns:
         The result of applying the jq filter to the input data.
+
+    Examples:
+        >>> extract_using_jq('{"a": 1, "b": 2}', '.a')
+        [1]
+        >>> extract_using_jq({'a': 1, 'b': 2}, '.b')
+        [2]
+        >>> extract_using_jq('[{"a": 1}, {"a": 2}]', '.[].a')
+        [1, 2]
+        >>> extract_using_jq('not a json', '.a')
+        ['Invalid JSON string provided.']
+        >>> extract_using_jq({'a': 1}, '')
+        {'a': 1}
     """
     if jq_filter == "":
         return data
@@ -344,6 +596,16 @@ def jsonpath_modifier(data: Any, jsonpath: str = "$[*]", mappings: Optional[Dict
 
     Raises:
         HTTPException: If there's an error parsing or executing the JSONPath expressions.
+
+    Examples:
+        >>> jsonpath_modifier({'a': 1, 'b': 2}, '$.a')
+        [1]
+        >>> jsonpath_modifier([{'a': 1}, {'a': 2}], '$[*].a')
+        [1, 2]
+        >>> jsonpath_modifier({'a': {'b': 2}}, '$.a.b')
+        [2]
+        >>> jsonpath_modifier({'a': 1}, '$.b')
+        []
     """
     if not jsonpath:
         jsonpath = "$[*]"

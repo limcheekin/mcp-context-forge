@@ -7,14 +7,17 @@ Authors: Mihai Criveti
 
 """
 
+# Standard
 import asyncio
 import os
 from unittest.mock import AsyncMock, patch
 
+# Third-Party
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+# First-Party
 from mcpgateway.config import Settings
 from mcpgateway.db import Base
 
@@ -70,6 +73,7 @@ def test_settings():
 def app(test_settings):
     """Create a FastAPI test application."""
     with patch("mcpgateway.config.get_settings", return_value=test_settings):
+        # First-Party
         from mcpgateway.main import app
 
         yield app
@@ -92,3 +96,14 @@ def mock_websocket():
     mock.receive_json = AsyncMock()
     mock.close = AsyncMock()
     return mock
+
+
+# @pytest.fixture(scope="session", autouse=True)
+# def _patch_stdio_first():
+#     """
+#     Runs once, *before* the test session collects other modules,
+#     so no rogue coroutine can be created.
+#     """
+#     import mcpgateway.translate as translate
+#     translate._run_stdio_to_sse = AsyncMock(return_value=None)
+#     translate._run_sse_to_stdio = AsyncMock(return_value=None)

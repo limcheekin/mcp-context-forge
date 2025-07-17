@@ -12,16 +12,19 @@ It handles server registration, listing, retrieval, updates, activation toggling
 It also publishes event notifications for server changes.
 """
 
+# Standard
 import asyncio
+from datetime import datetime, timezone
 import logging
-from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
+# Third-Party
 import httpx
 from sqlalchemy import delete, func, not_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+# First-Party
 from mcpgateway.config import settings
 from mcpgateway.db import Prompt as DbPrompt
 from mcpgateway.db import Resource as DbResource
@@ -45,6 +48,33 @@ class ServerNameConflictError(ServerError):
     """Raised when a server name conflicts with an existing one."""
 
     def __init__(self, name: str, is_active: bool = True, server_id: Optional[int] = None):
+        """Initialize a ServerNameConflictError exception.
+
+        Creates an exception that indicates a server name conflict, with additional
+        context about whether the conflicting server is active and its ID if known.
+        The error message is customized based on the server's active status.
+
+        Args:
+            name: The server name that caused the conflict.
+            is_active: Whether the conflicting server is currently active.
+                    Defaults to True.
+            server_id: The ID of the conflicting server, if known.
+                    Only included in message for inactive servers.
+
+        Examples:
+            >>> error = ServerNameConflictError("My Server")
+            >>> str(error)
+            'Server already exists with name: My Server'
+            >>> error = ServerNameConflictError("My Server", is_active=False, server_id=123)
+            >>> str(error)
+            'Server already exists with name: My Server (currently inactive, ID: 123)'
+            >>> error.name
+            'My Server'
+            >>> error.is_active
+            False
+            >>> error.server_id
+            123
+        """
         self.name = name
         self.is_active = is_active
         self.server_id = server_id
@@ -62,6 +92,26 @@ class ServerService:
     """
 
     def __init__(self) -> None:
+        """Initialize a new ServerService instance.
+
+        Sets up the service with:
+        - An empty list for event subscribers that will receive server change notifications
+        - An HTTP client configured with timeout and SSL verification settings from config
+
+        The HTTP client is used for health checks and other server-related HTTP operations.
+        Event subscribers can register to receive notifications about server additions,
+        updates, activations, deactivations, and deletions.
+
+        Examples:
+            >>> from mcpgateway.services.server_service import ServerService
+            >>> service = ServerService()
+            >>> isinstance(service._event_subscribers, list)
+            True
+            >>> len(service._event_subscribers)
+            0
+            >>> hasattr(service, '_http_client')
+            True
+        """
         self._event_subscribers: List[asyncio.Queue] = []
         self._http_client = httpx.AsyncClient(timeout=settings.federation_timeout, verify=not settings.skip_ssl_verify)
 
@@ -107,7 +157,7 @@ class ServerService:
             "last_execution_time": last_time,
         }
         # Also update associated IDs (if not already done)
-        server_dict["associated_tools"] = [tool.id for tool in server.tools] if server.tools else []
+        server_dict["associated_tools"] = [tool.name for tool in server.tools] if server.tools else []
         server_dict["associated_resources"] = [res.id for res in server.resources] if server.resources else []
         server_dict["associated_prompts"] = [prompt.id for prompt in server.prompts] if server.prompts else []
         return ServerRead.model_validate(server_dict)
@@ -161,6 +211,24 @@ class ServerService:
             ServerNameConflictError: If a server with the same name already exists.
             ServerError: If any associated tool, resource, or prompt does not exist, or if any other
                         registration error occurs.
+
+        Examples:
+            >>> from mcpgateway.services.server_service import ServerService
+            >>> from unittest.mock import MagicMock, AsyncMock
+            >>> from mcpgateway.schemas import ServerRead
+            >>> service = ServerService()
+            >>> db = MagicMock()
+            >>> server_in = MagicMock()
+            >>> db.execute.return_value.scalar_one_or_none.return_value = None
+            >>> db.add = MagicMock()
+            >>> db.commit = MagicMock()
+            >>> db.refresh = MagicMock()
+            >>> service._notify_server_added = AsyncMock()
+            >>> service._convert_server_to_read = MagicMock(return_value='server_read')
+            >>> ServerRead.model_validate = MagicMock(return_value='server_read')
+            >>> import asyncio
+            >>> asyncio.run(service.register_server(db, server_in))
+            'server_read'
         """
         try:
             # Check for an existing server with the same name.
@@ -182,7 +250,7 @@ class ServerService:
                 for tool_id in server_in.associated_tools:
                     if tool_id.strip() == "":
                         continue
-                    tool_obj = db.get(DbTool, int(tool_id))
+                    tool_obj = db.get(DbTool, tool_id)
                     if not tool_obj:
                         raise ServerError(f"Tool with id {tool_id} does not exist.")
                     db_server.tools.append(tool_obj)
@@ -246,6 +314,19 @@ class ServerService:
 
         Returns:
             A list of ServerRead objects.
+
+        Examples:
+            >>> from mcpgateway.services.server_service import ServerService
+            >>> from unittest.mock import MagicMock
+            >>> service = ServerService()
+            >>> db = MagicMock()
+            >>> server_read = MagicMock()
+            >>> service._convert_server_to_read = MagicMock(return_value=server_read)
+            >>> db.execute.return_value.scalars.return_value.all.return_value = [MagicMock()]
+            >>> import asyncio
+            >>> result = asyncio.run(service.list_servers(db))
+            >>> isinstance(result, list)
+            True
         """
         query = select(DbServer)
         if not include_inactive:
@@ -253,7 +334,7 @@ class ServerService:
         servers = db.execute(query).scalars().all()
         return [self._convert_server_to_read(s) for s in servers]
 
-    async def get_server(self, db: Session, server_id: int) -> ServerRead:
+    async def get_server(self, db: Session, server_id: str) -> ServerRead:
         """Retrieve server details by ID.
 
         Args:
@@ -265,6 +346,18 @@ class ServerService:
 
         Raises:
             ServerNotFoundError: If no server with the given ID exists.
+
+        Examples:
+            >>> from mcpgateway.services.server_service import ServerService
+            >>> from unittest.mock import MagicMock
+            >>> service = ServerService()
+            >>> db = MagicMock()
+            >>> server = MagicMock()
+            >>> db.get.return_value = server
+            >>> service._convert_server_to_read = MagicMock(return_value='server_read')
+            >>> import asyncio
+            >>> asyncio.run(service.get_server(db, 'server_id'))
+            'server_read'
         """
         server = db.get(DbServer, server_id)
         if not server:
@@ -277,14 +370,14 @@ class ServerService:
             "created_at": server.created_at,
             "updated_at": server.updated_at,
             "is_active": server.is_active,
-            "associated_tools": [tool.id for tool in server.tools],
+            "associated_tools": [tool.name for tool in server.tools],
             "associated_resources": [res.id for res in server.resources],
             "associated_prompts": [prompt.id for prompt in server.prompts],
         }
         logger.debug(f"Server Data: {server_data}")
         return self._convert_server_to_read(server)
 
-    async def update_server(self, db: Session, server_id: int, server_update: ServerUpdate) -> ServerRead:
+    async def update_server(self, db: Session, server_id: str, server_update: ServerUpdate) -> ServerRead:
         """Update an existing server.
 
         Args:
@@ -299,6 +392,23 @@ class ServerService:
             ServerNotFoundError: If the server is not found.
             ServerNameConflictError: If a new name conflicts with an existing server.
             ServerError: For other update errors.
+
+        Examples:
+            >>> from mcpgateway.services.server_service import ServerService
+            >>> from unittest.mock import MagicMock, AsyncMock
+            >>> from mcpgateway.schemas import ServerRead
+            >>> service = ServerService()
+            >>> db = MagicMock()
+            >>> server = MagicMock()
+            >>> db.get.return_value = server
+            >>> db.commit = MagicMock()
+            >>> db.refresh = MagicMock()
+            >>> db.execute.return_value.scalar_one_or_none.return_value = None
+            >>> service._convert_server_to_read = MagicMock(return_value='server_read')
+            >>> ServerRead.model_validate = MagicMock(return_value='server_read')
+            >>> import asyncio
+            >>> asyncio.run(service.update_server(db, 'server_id', MagicMock()))
+            'server_read'
         """
         try:
             server = db.get(DbServer, server_id)
@@ -327,7 +437,7 @@ class ServerService:
             if server_update.associated_tools is not None:
                 server.tools = []
                 for tool_id in server_update.associated_tools:
-                    tool_obj = db.get(DbTool, int(tool_id))
+                    tool_obj = db.get(DbTool, tool_id)
                     if tool_obj:
                         server.tools.append(tool_obj)
 
@@ -347,7 +457,7 @@ class ServerService:
                     if prompt_obj:
                         server.prompts.append(prompt_obj)
 
-            server.updated_at = datetime.utcnow()
+            server.updated_at = datetime.now(timezone.utc)
             db.commit()
             db.refresh(server)
             # Force loading relationships
@@ -375,7 +485,7 @@ class ServerService:
             db.rollback()
             raise ServerError(f"Failed to update server: {str(e)}")
 
-    async def toggle_server_status(self, db: Session, server_id: int, activate: bool) -> ServerRead:
+    async def toggle_server_status(self, db: Session, server_id: str, activate: bool) -> ServerRead:
         """Toggle the activation status of a server.
 
         Args:
@@ -389,6 +499,24 @@ class ServerService:
         Raises:
             ServerNotFoundError: If the server is not found.
             ServerError: For other errors.
+
+        Examples:
+            >>> from mcpgateway.services.server_service import ServerService
+            >>> from unittest.mock import MagicMock, AsyncMock
+            >>> from mcpgateway.schemas import ServerRead
+            >>> service = ServerService()
+            >>> db = MagicMock()
+            >>> server = MagicMock()
+            >>> db.get.return_value = server
+            >>> db.commit = MagicMock()
+            >>> db.refresh = MagicMock()
+            >>> service._notify_server_activated = AsyncMock()
+            >>> service._notify_server_deactivated = AsyncMock()
+            >>> service._convert_server_to_read = MagicMock(return_value='server_read')
+            >>> ServerRead.model_validate = MagicMock(return_value='server_read')
+            >>> import asyncio
+            >>> asyncio.run(service.toggle_server_status(db, 'server_id', True))
+            'server_read'
         """
         try:
             server = db.get(DbServer, server_id)
@@ -397,7 +525,7 @@ class ServerService:
 
             if server.is_active != activate:
                 server.is_active = activate
-                server.updated_at = datetime.utcnow()
+                server.updated_at = datetime.now(timezone.utc)
                 db.commit()
                 db.refresh(server)
                 if activate:
@@ -424,7 +552,7 @@ class ServerService:
             db.rollback()
             raise ServerError(f"Failed to toggle server status: {str(e)}")
 
-    async def delete_server(self, db: Session, server_id: int) -> None:
+    async def delete_server(self, db: Session, server_id: str) -> None:
         """Permanently delete a server.
 
         Args:
@@ -434,6 +562,19 @@ class ServerService:
         Raises:
             ServerNotFoundError: If the server is not found.
             ServerError: For other deletion errors.
+
+        Examples:
+            >>> from mcpgateway.services.server_service import ServerService
+            >>> from unittest.mock import MagicMock, AsyncMock
+            >>> service = ServerService()
+            >>> db = MagicMock()
+            >>> server = MagicMock()
+            >>> db.get.return_value = server
+            >>> db.delete = MagicMock()
+            >>> db.commit = MagicMock()
+            >>> service._notify_server_deleted = AsyncMock()
+            >>> import asyncio
+            >>> asyncio.run(service.delete_server(db, 'server_id'))
         """
         try:
             server = db.get(DbServer, server_id)
@@ -497,7 +638,7 @@ class ServerService:
                 "associated_prompts": associated_prompts,
                 "is_active": server.is_active,
             },
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         await self._publish_event(event)
 
@@ -523,7 +664,7 @@ class ServerService:
                 "associated_prompts": associated_prompts,
                 "is_active": server.is_active,
             },
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         await self._publish_event(event)
 
@@ -541,7 +682,7 @@ class ServerService:
                 "name": server.name,
                 "is_active": True,
             },
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         await self._publish_event(event)
 
@@ -559,7 +700,7 @@ class ServerService:
                 "name": server.name,
                 "is_active": False,
             },
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         await self._publish_event(event)
 
@@ -573,7 +714,7 @@ class ServerService:
         event = {
             "type": "server_deleted",
             "data": server_info,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         await self._publish_event(event)
 
@@ -587,6 +728,17 @@ class ServerService:
 
         Returns:
             ServerMetrics: Aggregated metrics computed from all ServerMetric records.
+
+        Examples:
+            >>> from mcpgateway.services.server_service import ServerService
+            >>> from unittest.mock import MagicMock
+            >>> service = ServerService()
+            >>> db = MagicMock()
+            >>> db.execute.return_value.scalar.return_value = 0
+            >>> import asyncio
+            >>> result = asyncio.run(service.aggregate_metrics(db))
+            >>> hasattr(result, 'total_executions')
+            True
         """
         total_executions = db.execute(select(func.count()).select_from(ServerMetric)).scalar() or 0  # pylint: disable=not-callable
 
@@ -619,6 +771,16 @@ class ServerService:
 
         Args:
             db: Database session
+
+        Examples:
+            >>> from mcpgateway.services.server_service import ServerService
+            >>> from unittest.mock import MagicMock
+            >>> service = ServerService()
+            >>> db = MagicMock()
+            >>> db.execute = MagicMock()
+            >>> db.commit = MagicMock()
+            >>> import asyncio
+            >>> asyncio.run(service.reset_metrics(db))
         """
         db.execute(delete(ServerMetric))
         db.commit()

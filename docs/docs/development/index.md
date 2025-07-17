@@ -10,6 +10,7 @@ Welcome! This guide is for developers contributing to MCP Gateway. Whether you'r
 | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
 | [Building Locally](building.md)                                                   | How to install dependencies, set up a virtual environment, and run the gateway |
 | [Packaging](packaging.md)                                                         | How to build a release, container image, or prebuilt binary                    |
+| [Doctest Coverage](doctest-coverage.md)                                           | Comprehensive doctest coverage implementation and guidelines                    |
 | [DEVELOPING.md](https://github.com/IBM/mcp-context-forge/blob/main/DEVELOPING.md) | Coding standards, commit conventions, and review workflow                      |
 
 ---
@@ -92,14 +93,11 @@ make podman-run-ssl    # run with self-signed TLS at https://localhost:4444
 
 Admin UI and API are protected by Basic Auth or JWT.
 
-To generate a JWT:
+To generate a JWT token:
 
 ```bash
-python3 -m mcpgateway.utils.create_jwt_token \
-  -u admin \
-  -e 10080 | tee token.txt
-
-export MCPGATEWAY_BEARER_TOKEN=$(cat token.txt)
+export MCPGATEWAY_BEARER_TOKEN=$(python3 -m mcpgateway.utils.create_jwt_token --username admin --exp 0 --secret my-test-key)
+echo $MCPGATEWAY_BEARER_TOKEN
 ```
 
 Then test:

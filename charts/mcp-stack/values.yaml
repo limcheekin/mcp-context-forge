@@ -1,18 +1,75 @@
+########################################################################
+# GLOBAL SETTINGS
+# These are applied across the entire Helm release.
+########################################################################
 global:
-  imagePullSecrets: []
-  nameOverride: ""
-  fullnameOverride: ""
+  imagePullSecrets: []          # e.g. ["ghcr-creds"] for a private registry
+  nameOverride: ""              # short name applied to all resources (optional)
+  fullnameOverride: ""          # fully-qualified name override (optional)
 
+########################################################################
+# MCP CONTEXT-FORGE (Gateway / API tier)
+########################################################################
 mcpContextForge:
-  replicaCount: 1
+  replicaCount: 2                           # horizontal scaling for the gateway
+
+  # --- HORIZONTAL POD AUTOSCALER --------------------------------------
+  # * Percentages compare live usage with the container *request* values
+  #   (limits are ignored by the HPA).
+  # * If both CPU and memory targets are set, crossing either threshold
+  #   triggers a scale event.
+  # --------------------------------------------------------------------
+  hpa:
+    enabled: true                           # Set to false to keep a fixed replica count
+    minReplicas: 2                          # Never scale below this
+    maxReplicas: 10                         # Never scale above this
+    targetCPUUtilizationPercentage: 90      # Scale up when avg CPU > 90 % of *request*
+    targetMemoryUtilizationPercentage: 90   # Scale up when avg memory > 90 % of *request*
+
   image:
     repository: ghcr.io/ibm/mcp-context-forge
-    tag: latest
-    pullPolicy: IfNotPresent
+    tag: latest                 # pin a specific immutable tag in production
+    #pullPolicy: IfNotPresent
+    pullPolicy: Always          # always pull the latest image; useful for dev/testing
+
+  # Service that fronts the gateway
   service:
     type: ClusterIP
-    port: 80
-  containerPort: 4444
+    port: 80                    # external port → containerPort below
+
+  containerPort: 4444           # port the app listens on inside the pod
+
+  # Health & readiness probes
+  probes:
+    startup:
+      # Uncomment to enable sleep startup probe; useful for long-running initializations
+      type: exec
+      command: ["sh", "-c", "sleep 10"]
+      timeoutSeconds: 15      # must exceed the 10-second sleep
+      periodSeconds: 5
+      failureThreshold: 1
+
+    readiness:
+      type: http
+      path: /ready
+      port: 4444
+      initialDelaySeconds: 15 # wait 15 s after container start
+      periodSeconds: 10       # check every 10 s
+      timeoutSeconds: 2       # fail if no response in 2 s
+      successThreshold: 1     # one success flips it back to healthy
+      failureThreshold: 3     # three failures mark pod un-ready
+
+    liveness:
+      type: http
+      path: /health
+      port: 4444
+      initialDelaySeconds: 10 # wait 10 s after container start
+      periodSeconds: 15
+      timeoutSeconds: 2
+      successThreshold: 1
+      failureThreshold: 3
+
+  # Kubernetes resource requests / limits
   resources:
     limits:
       cpu: 200m
@@ -20,74 +77,438 @@ mcpContextForge:
     requests:
       cpu: 100m
       memory: 512Mi
+
+  # Optional ingress for HTTP traffic
   ingress:
     enabled: true
     className: nginx
-    host: gateway.local
+    host: gateway.local         # CHANGE to your FQDN (e.g. api.example.com)
     path: /
     pathType: Prefix
     annotations:
       nginx.ingress.kubernetes.io/rewrite-target: /
+
+  ####################################################################
+  # CORE ENVIRONMENT - injected one-by-one as name/value pairs.
+  # Only the DATABASE / CACHE connection points live here; everything
+  # else goes into the ConfigMap or Secret blocks below.
+  ####################################################################
   env:
-    host: 0.0.0.0
+    host: 0.0.0.0               # bind address inside the container
+
     postgres:
-      host: postgres
+      # host is auto-generated as <release>-mcp-stack-postgres
+      # host: postgres          # uncomment to override the generated name
       port: 5432
       db: postgresdb
-      userKey: POSTGRES_USER
+      userKey: POSTGRES_USER    # key in the secret that stores the username
       passwordKey: POSTGRES_PASSWORD
+
     redis:
-      host: redis
+      # host is auto-generated as <release>-mcp-stack-redis
+      # host: redis             # uncomment to override the generated name
       port: 6379
 
+  ####################################################################
+  # PLAIN-TEXT (NON-SECRET) SETTINGS
+  # Rendered into a ConfigMap; readable by anyone with GET access.
+  ####################################################################
+  config:
+    # - Gunicorn settings ─
+    GUNICORN_WORKERS: "2"               # number of worker processes
+    GUNICORN_TIMEOUT: "600"             # worker timeout in seconds
+    GUNICORN_MAX_REQUESTS: "10000"      # max requests per worker before restart
+    GUNICORN_MAX_REQUESTS_JITTER: "100" # random jitter to avoid thundering herd
+    GUNICORN_PRELOAD_APP: "true"        # preload app code before forking workers (TODO: not implemented yet)
+
+    # ─ Basic application info ─
+    APP_NAME: MCP_Gateway            # public-facing name of the gateway
+    HOST: 0.0.0.0                    # address the server binds to
+    PORT: "4444"                     # internal container port
+    APP_ROOT_PATH: ""                # e.g. "/gateway" when deploying under sub-path
+
+    # ─ Connection pooling ─
+    DB_POOL_SIZE: "200"              # size of SQLAlchemy connection pool
+    DB_MAX_OVERFLOW: "10"            # extra connections allowed beyond pool size
+    DB_POOL_TIMEOUT: "30"            # seconds to wait for a connection
+    DB_POOL_RECYCLE: "3600"          # recycle connections after N seconds
+
+    # ─ Cache behaviour ─
+    CACHE_TYPE: redis                # Backend cache driver (redis, memory, database)
+    CACHE_PREFIX: mcpgw              # Prefix applied to every cache key
+    SESSION_TTL: "3600"              # TTL (s) for user sessions
+    MESSAGE_TTL: "600"               # TTL (s) for ephemeral messages (completions)
+
+    # ─ Connection retry settings ─
+    REDIS_MAX_RETRIES: "3"           # Maximum retries for Redis cold start
+    REDIS_RETRY_INTERVAL_MS: "2000"  # Interval between Redis retries (ms)
+    DB_MAX_RETRIES: "3"              # Maximum retries for DB cold start
+    DB_RETRY_INTERVAL_MS: "2000"     # Interval between DB retries (ms)
+
+    # ─ Protocol & feature toggles ─
+    PROTOCOL_VERSION: 2025-03-26
+    MCPGATEWAY_UI_ENABLED: "true"    # toggle Admin UI
+    MCPGATEWAY_ADMIN_API_ENABLED: "true" # toggle Admin API endpoints
+    CORS_ENABLED: "true"             # enable CORS processing in gateway
+    ALLOWED_ORIGINS: '["http://localhost","http://localhost:4444"]' # JSON list of allowed origins
+    SKIP_SSL_VERIFY: "false"         # skip TLS certificate verification on upstream calls
+
+    # ─ Logging ─
+    LOG_LEVEL: INFO                  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+    LOG_FORMAT: json                 # json or text format
+
+    # ─ Transports ─
+    TRANSPORT_TYPE: all              # comma-separated list: http, ws, sse, stdio, all
+    WEBSOCKET_PING_INTERVAL: "30"    # seconds between WS pings
+    SSE_RETRY_TIMEOUT: "5000"        # milliseconds before SSE client retries
+
+    # ─ Streaming sessions ─
+    USE_STATEFUL_SESSIONS: "false"   # true = use event store; false = stateless
+    JSON_RESPONSE_ENABLED: "true"    # default to JSON; false for SSE stream
+
+    # ─ Federation ─
+    FEDERATION_ENABLED: "true"       # enable federated mode
+    FEDERATION_DISCOVERY: "false"    # advertise & discover peers automatically
+    FEDERATION_PEERS: '[]'           # explicit peer list (JSON array)
+    FEDERATION_TIMEOUT: "30"         # seconds before peer request timeout
+    FEDERATION_SYNC_INTERVAL: "300"  # seconds between peer syncs
+
+    # ─ Resource cache ─
+    RESOURCE_CACHE_SIZE: "1000"      # max resources kept in memory cache
+    RESOURCE_CACHE_TTL: "3600"       # TTL (s) for resources in cache
+    MAX_RESOURCE_SIZE: "10485760"    # max allowed resource size in bytes (10 MB)
+
+    # ─ Tool limits ─
+    TOOL_TIMEOUT: "60"               # seconds per tool execution
+    MAX_TOOL_RETRIES: "3"            # retries for failed tool runs
+    TOOL_RATE_LIMIT: "100"           # invocations per minute cap
+    TOOL_CONCURRENT_LIMIT: "10"      # concurrent tool executions
+
+    # ─ Prompt cache ─
+    PROMPT_CACHE_SIZE: "100"         # number of prompt templates to cache
+    MAX_PROMPT_SIZE: "102400"        # max template size in bytes
+    PROMPT_RENDER_TIMEOUT: "10"      # seconds to render a template
+
+    # ─ Health checks ─
+    HEALTH_CHECK_INTERVAL: "60"      # seconds between peer health checks
+    HEALTH_CHECK_TIMEOUT: "10"       # request timeout per health check
+    UNHEALTHY_THRESHOLD: "3"         # failed checks before peer marked unhealthy
+    FILELOCK_NAME: gateway_healthcheck_init.lock # lock file used at start-up
+
+    # ─ Development toggles ─
+    DEV_MODE: "false"                # enable dev-mode features
+    RELOAD: "false"                  # auto-reload code on changes
+    DEBUG: "false"                   # verbose debug traces
+
+  ####################################################################
+  # SENSITIVE SETTINGS
+  # Rendered into an Opaque Secret.  NO $(VAR) expansion here.
+  # DATABASE_URL & REDIS_URL are declared inside the Deployment
+  # so their placeholders resolve at runtime. Override them if needed.
+  ####################################################################
+  secret:
+    # ─ Admin & auth ─
+    BASIC_AUTH_USER: admin                 # username for basic-auth login
+    BASIC_AUTH_PASSWORD: changeme          # password for basic-auth (CHANGE IN PROD!)
+    AUTH_REQUIRED: "true"                  # enforce authentication globally (true/false)
+    JWT_SECRET_KEY: my-test-key            # secret key used to sign JWT tokens
+    JWT_ALGORITHM: HS256                   # signing algorithm for JWT tokens
+    TOKEN_EXPIRY: "10080"                  # JWT validity (minutes); 10080 = 7 days
+    AUTH_ENCRYPTION_SECRET: my-test-salt   # passphrase to derive AES key for secure storage
+    # (derived URLs are defined in deployment-mcp.yaml)
+
+    # ─ Optional database / redis overrides ─
+    # DATABASE_URL: "postgresql://admin:s3cr3t@db.acme.com:5432/prod" # override the auto-generated URL
+    # REDIS_URL:    "redis://cache.acme.com:6379/0"                   # override the auto-generated URL
+
+  ####################################################################
+  # Names of ConfigMap / Secret are resolved by templates; leave as-is.
+  ####################################################################
+  envFrom:
+    - secretRef:
+        name: mcp-gateway-secret
+    - configMapRef:
+        name: mcp-gateway-config
+
+########################################################################
+# DATABASE MIGRATION (Alembic)
+# Runs as a Job before mcpgateway deployment
+########################################################################
+migration:
+  enabled: true                             # Set to false to skip migrations
+
+  # Job configuration
+  restartPolicy: Never                      # Job should not restart on failure
+  backoffLimit: 3                           # Retry up to 3 times before giving up
+  activeDeadlineSeconds: 600                # Kill job after 10 minutes
+
+  # Use same image as mcpgateway
+  image:
+    repository: ghcr.io/ibm/mcp-context-forge
+    tag: latest                             # Should match mcpContextForge.image.tag
+    #pullPolicy: IfNotPresent
+    pullPolicy: Always                      # always pull the latest image; useful for dev/testing
+
+  # Resource limits for the migration job
+  resources:
+    limits:
+      cpu: 200m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+
+  # Migration command configuration
+  command:
+    waitForDb: "python3 /app/mcpgateway/utils/db_isready.py --max-tries 30 --interval 2 --timeout 5"
+    migrate: "alembic upgrade head || echo '⚠️ Migration check failed'"
+
+########################################################################
+# POSTGRES DATABASE
+########################################################################
 postgres:
   enabled: true
+
   image:
     repository: postgres
     tag: "17"
     pullPolicy: IfNotPresent
+
   service:
     type: ClusterIP
     port: 5432
+
+  # PersistentVolumeClaim for data durability
   persistence:
     enabled: true
-    storageClassName: manual
+    storageClassName: manual     # pick a StorageClass (e.g. gp2, standard)
     accessModes: [ReadWriteMany]
     size: 5Gi
-  credentials:
+
+  # Leave blank to autogenerate <release>-mcp-stack-postgres-secret.
+  existingSecret: ""
+
+  credentials:                  # used only when existingSecret is blank
     database: postgresdb
     user: admin
-    password: test123
+    password: test123           # CHANGE ME in production!
 
+  # ─── Resource limits & requests ───
+  resources:
+    limits:
+      cpu: 1000m          # 1 core hard cap
+      memory: 1Gi
+    requests:
+      cpu: 500m           # guaranteed half-core
+      memory: 64Mi
+
+  # ─── Health & readiness probes ───
+  probes:
+    readiness:
+      type: exec
+      command: ["pg_isready", "-U", "$(POSTGRES_USER)"]
+      initialDelaySeconds: 15
+      periodSeconds: 10
+      timeoutSeconds: 3
+      successThreshold: 1
+      failureThreshold: 3
+
+    liveness:
+      type: exec
+      command: ["pg_isready", "-U", "$(POSTGRES_USER)"]
+      initialDelaySeconds: 10
+      periodSeconds: 15
+      timeoutSeconds: 3
+      successThreshold: 1
+      failureThreshold: 5
+
+########################################################################
+# REDIS CACHE
+########################################################################
 redis:
   enabled: true
+
   image:
     repository: redis
     tag: latest
     pullPolicy: IfNotPresent
+
   service:
     type: ClusterIP
     port: 6379
 
+  # ─── Resource limits & requests ───
+  resources:
+    limits:
+      cpu: 100m          # cap at 0.1 core, 256 MiB
+      memory: 256Mi
+    requests:
+      cpu: 50m           # reserve 0.05 core, 128 MiB
+      memory: 16Mi
+
+  # ─── Health & readiness probes ───
+  probes:
+    readiness:
+      type: exec
+      command: ["redis-cli", "PING"]
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      timeoutSeconds: 2
+      successThreshold: 1
+      failureThreshold: 3
+
+    liveness:
+      type: exec
+      command: ["redis-cli", "PING"]
+      initialDelaySeconds: 5
+      periodSeconds: 15
+      timeoutSeconds: 2
+      successThreshold: 1
+      failureThreshold: 5
+
+########################################################################
+# PGADMIN - Web UI for Postgres
+########################################################################
 pgadmin:
-  enabled: false
+  enabled: true
+
   image:
     repository: dpage/pgadmin4
     tag: latest
     pullPolicy: IfNotPresent
+
   service:
     type: ClusterIP
     port: 80
-  env:
-    email: admin@local.test
-    password: admin123
 
+  env:
+    email: admin@example.com
+    password: admin123           # CHANGE ME in production!
+
+  # ─── Resource limits & requests ───
+  resources:
+    limits:
+      cpu: 200m          # cap at 0.2 core, 256 MiB
+      memory: 256Mi
+    requests:
+      cpu: 100m          # reserve 0.1 core, 128 MiB
+      memory: 128Mi
+
+  # ─── Health & readiness probes ───
+  probes:
+    readiness:
+      type: http
+      path: /misc/ping      # lightweight endpoint
+      port: 80
+      initialDelaySeconds: 15
+      periodSeconds: 10
+      timeoutSeconds: 2
+      successThreshold: 1
+      failureThreshold: 3
+
+    liveness:
+      type: http
+      path: /misc/ping
+      port: 80
+      initialDelaySeconds: 10
+      periodSeconds: 15
+      timeoutSeconds: 2
+      successThreshold: 1
+      failureThreshold: 5
+
+########################################################################
+# REDIS-COMMANDER - Web UI for Redis
+########################################################################
 redisCommander:
-  enabled: false
+  enabled: true
+
   image:
     repository: rediscommander/redis-commander
     tag: latest
     pullPolicy: IfNotPresent
+
   service:
     type: ClusterIP
     port: 8081
+
+  # ─── Resource limits & requests ───
+  resources:
+    limits:
+      cpu: 100m          # cap at 0.1 core, 256 MiB
+      memory: 256Mi
+    requests:
+      cpu: 50m           # reserve 0.05 core, 128 MiB
+      memory: 128Mi
+
+  # ─── Health & readiness probes ───
+  probes:
+    readiness:
+      type: http
+      path: /              # root returns 200 OK
+      port: 8081
+      initialDelaySeconds: 15
+      periodSeconds: 10
+      timeoutSeconds: 2
+      successThreshold: 1
+      failureThreshold: 3
+
+    liveness:
+      type: http
+      path: /
+      port: 8081
+      initialDelaySeconds: 10
+      periodSeconds: 15
+      timeoutSeconds: 2
+      successThreshold: 1
+      failureThreshold: 5
+
+########################################################################
+# MCP-FAST-TIME-SERVER - optional high-performance time server for MCP (go)
+# Provides a fast implementation including SSE and Streamable HTTP
+########################################################################
+mcpFastTimeServer:
+  enabled: true            # switch to true to deploy
+  replicaCount: 2
+  image:
+    repository: ghcr.io/ibm/fast-time-server
+    tag: "0.3.0"
+    pullPolicy: IfNotPresent
+  port: 8080
+
+  # Ingress example (leave as-is if you already have it)
+  ingress:
+    enabled: true
+    path: /fast-time
+    pathType: Prefix
+    servicePort: 80
+
+  # ─── Health & readiness probes ───
+  probes:
+    readiness:
+      type: http
+      path: /health
+      port: 8080
+      initialDelaySeconds: 3
+      periodSeconds: 10
+      timeoutSeconds: 2
+      successThreshold: 1
+      failureThreshold: 3
+
+    liveness:
+      type: http
+      path: /health
+      port: 8080
+      initialDelaySeconds: 3
+      periodSeconds: 15
+      timeoutSeconds: 2
+      successThreshold: 1
+      failureThreshold: 3
+
+  # Tiny Go process: ~10 MB runtime footprint
+  resources:
+    limits:
+      cpu: 50m           # ~5 % of a core
+      memory: 64Mi
+    requests:
+      cpu: 25m
+      memory: 10Mi

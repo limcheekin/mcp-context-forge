@@ -1,19 +1,47 @@
 # -*- coding: utf-8 -*-
-"""
+"""mcpgateway.utils.services_auth - Authentication utilities for MCP Gateway
 
 Copyright 2025
 SPDX-License-Identifier: Apache-2.0
 Authors: Mihai Criveti
 
+Doctest examples
+----------------
+>>> import os
+>>> from mcpgateway.utils import services_auth
+>>> os.environ['AUTH_ENCRYPTION_SECRET'] = 'doctest-secret'
+>>> services_auth.settings.auth_encryption_secret = 'doctest-secret'
+>>> key = services_auth.get_key()
+>>> isinstance(key, bytes)
+True
+>>> d = {'user': 'alice'}
+>>> token = services_auth.encode_auth(d)
+>>> isinstance(token, str)
+True
+>>> services_auth.decode_auth(token) == d
+True
+>>> services_auth.encode_auth(None) is None
+True
+>>> services_auth.decode_auth(None) == {}
+True
+>>> services_auth.settings.auth_encryption_secret = ''
+>>> try:
+...     services_auth.get_key()
+... except ValueError as e:
+...     print('error')
+error
 """
 
+# Standard
 import base64
 import hashlib
 import json
 import os
 
+# Third-Party
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+# First-Party
 from mcpgateway.config import settings
 
 
@@ -26,6 +54,21 @@ def get_key() -> bytes:
 
     Raises:
         ValueError: If the passphrase is not set or empty.
+
+    Doctest:
+    >>> import os
+    >>> from mcpgateway.utils import services_auth
+    >>> os.environ['AUTH_ENCRYPTION_SECRET'] = 'doctest-secret'
+    >>> services_auth.settings.auth_encryption_secret = 'doctest-secret'
+    >>> key = services_auth.get_key()
+    >>> isinstance(key, bytes)
+    True
+    >>> services_auth.settings.auth_encryption_secret = ''
+    >>> try:
+    ...     services_auth.get_key()
+    ... except ValueError as e:
+    ...     print('error')
+    error
     """
     passphrase = settings.auth_encryption_secret
     if not passphrase:
@@ -42,6 +85,17 @@ def encode_auth(auth_value: dict) -> str:
 
     Returns:
         str: A base64-url-safe encrypted string representing the dictionary, or None if input is None.
+
+    Doctest:
+    >>> import os
+    >>> from mcpgateway.utils import services_auth
+    >>> os.environ['AUTH_ENCRYPTION_SECRET'] = 'doctest-secret'
+    >>> services_auth.settings.auth_encryption_secret = 'doctest-secret'
+    >>> token = services_auth.encode_auth({'user': 'alice'})
+    >>> isinstance(token, str)
+    True
+    >>> services_auth.encode_auth(None) is None
+    True
     """
     if not auth_value:
         return None
@@ -64,6 +118,18 @@ def decode_auth(encoded_value: str) -> dict:
 
     Returns:
         dict: The decrypted authentication dictionary, or empty dict if input is None.
+
+    Doctest:
+    >>> import os
+    >>> from mcpgateway.utils import services_auth
+    >>> os.environ['AUTH_ENCRYPTION_SECRET'] = 'doctest-secret'
+    >>> services_auth.settings.auth_encryption_secret = 'doctest-secret'
+    >>> d = {'user': 'alice'}
+    >>> token = services_auth.encode_auth(d)
+    >>> services_auth.decode_auth(token) == d
+    True
+    >>> services_auth.decode_auth(None) == {}
+    True
     """
     if not encoded_value:
         return {}

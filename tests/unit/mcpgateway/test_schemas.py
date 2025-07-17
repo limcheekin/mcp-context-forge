@@ -6,17 +6,21 @@ SPDX-License-Identifier: Apache-2.0
 Authors: Mihai Criveti
 
 This module contains tests for the various MCP protocol type definitions
-defined in the types.py module.
+defined in the models.py module.
 """
 
+# Standard
+from datetime import datetime, timedelta, timezone
 import json
 import os
-from datetime import datetime
+from unittest.mock import Mock
 
-import pytest
+# Third-Party
 from pydantic import ValidationError
+import pytest
 
-from mcpgateway.types import (
+# First-Party
+from mcpgateway.models import (
     ClientCapabilities,
     CreateMessageResult,
     ImageContent,
@@ -42,6 +46,18 @@ from mcpgateway.types import (
     TextContent,
     Tool,
     ToolResult,
+)
+from mcpgateway.schemas import (
+    AdminGatewayCreate,
+    AdminToolCreate,
+    EventMessage,
+    ListFilters,
+    ServerCreate,
+    ServerMetrics,
+    ServerRead,
+    ServerUpdate,
+    StatusToggleRequest,
+    StatusToggleResponse,
 )
 
 PROTOCOL_VERSION = os.getenv("PROTOCOL_VERSION", "2025-03-26")
@@ -572,7 +588,7 @@ class TestEventAndAdminSchemas:
 
     def test_event_message(self):
         """Test EventMessage model."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         event = EventMessage(
             type="resource_updated",
@@ -728,18 +744,18 @@ class TestServerSchemas:
 
     def test_server_read(self):
         """Test ServerRead model."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         one_hour_ago = now - timedelta(hours=1)
 
         server = ServerRead(
-            id=1,
+            id="1",
             name="Test Server",
             description="Test server instance",
             icon="http://example.com/server.png",
             created_at=one_hour_ago,
             updated_at=now,
             is_active=True,
-            associated_tools=[1, 2, 3],
+            associated_tools=["1", "2", "3"],
             associated_resources=[4, 5],
             associated_prompts=[6],
             metrics=ServerMetrics(
@@ -754,14 +770,14 @@ class TestServerSchemas:
             ),
         )
 
-        assert server.id == 1
+        assert server.id == "1"
         assert server.name == "Test Server"
         assert server.description == "Test server instance"
         assert server.icon == "http://example.com/server.png"
         assert server.created_at == one_hour_ago
         assert server.updated_at == now
         assert server.is_active is True
-        assert server.associated_tools == [1, 2, 3]
+        assert server.associated_tools == ["1", "2", "3"]
         assert server.associated_resources == [4, 5]
         assert server.associated_prompts == [6]
         assert server.metrics.total_executions == 100
@@ -769,13 +785,14 @@ class TestServerSchemas:
 
         # Test root validator for associated IDs
         server_with_objects = ServerRead(
-            id=2,
+            id="f1548803b0ff4bf7833b762b0a8c5c34",
             name="Object Server",
             description="Server with object associations",
+            icon="http://example.com/object_server.png",
             created_at=one_hour_ago,
             updated_at=now,
             is_active=True,
-            associated_tools=[Mock(id=10), Mock(id=11)],
+            associated_tools=[Mock(id="10"), Mock(id="11")],
             associated_resources=[Mock(id=12)],
             associated_prompts=[Mock(id=13)],
             metrics=ServerMetrics(
@@ -786,7 +803,7 @@ class TestServerSchemas:
             ),
         )
 
-        assert server_with_objects.associated_tools == [10, 11]
+        assert server_with_objects.associated_tools == ["10", "11"]
         assert server_with_objects.associated_resources == [12]
         assert server_with_objects.associated_prompts == [13]
 

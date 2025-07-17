@@ -16,16 +16,30 @@ CLI (default secret, default payload):
     $ python3 jwt_cli.py
 
 Library:
-```python
-from mcpgateway.utils.create_jwt_token import create_jwt_token, get_jwt_token
+    from mcpgateway.utils.create_jwt_token import create_jwt_token, get_jwt_token
 
-# inside async context
-jwt = await create_jwt_token({"username": "alice"})
-```
+    # inside async context
+    jwt = await create_jwt_token({"username": "alice"})
+
+Doctest examples
+----------------
+>>> from mcpgateway.utils import create_jwt_token as jwt_util
+>>> jwt_util.settings.jwt_secret_key = 'secret'
+>>> jwt_util.settings.jwt_algorithm = 'HS256'
+>>> token = jwt_util._create_jwt_token({'sub': 'alice'}, expires_in_minutes=1, secret='secret', algorithm='HS256')
+>>> import jwt
+>>> jwt.decode(token, 'secret', algorithms=['HS256'])['sub'] == 'alice'
+True
+>>> import asyncio
+>>> t = asyncio.run(jwt_util.create_jwt_token({'sub': 'bob'}, expires_in_minutes=1, secret='secret', algorithm='HS256'))
+>>> jwt.decode(t, 'secret', algorithms=['HS256'])['sub'] == 'bob'
+True
 """
 
+# Future
 from __future__ import annotations
 
+# Standard
 import argparse
 import asyncio
 import datetime as _dt
@@ -33,8 +47,10 @@ import json
 import sys
 from typing import Any, Dict, List, Sequence
 
+# Third-Party
 import jwt  # PyJWT
 
+# First-Party
 from mcpgateway.config import settings
 
 __all__: Sequence[str] = (
@@ -63,7 +79,8 @@ def _create_jwt_token(
     secret: str = DEFAULT_SECRET,
     algorithm: str = DEFAULT_ALGO,
 ) -> str:
-    """Return a signed JWT string (synchronous, timezone-aware).
+    """
+    Return a signed JWT string (synchronous, timezone-aware).
 
     Args:
         data: Dictionary containing payload data to encode in the token.
@@ -74,6 +91,15 @@ def _create_jwt_token(
 
     Returns:
         The JWT token string.
+
+    Doctest:
+    >>> from mcpgateway.utils import create_jwt_token as jwt_util
+    >>> jwt_util.settings.jwt_secret_key = 'secret'
+    >>> jwt_util.settings.jwt_algorithm = 'HS256'
+    >>> token = jwt_util._create_jwt_token({'sub': 'alice'}, expires_in_minutes=1, secret='secret', algorithm='HS256')
+    >>> import jwt
+    >>> jwt.decode(token, 'secret', algorithms=['HS256'])['sub'] == 'alice'
+    True
     """
     payload = data.copy()
     if expires_in_minutes > 0:
@@ -94,7 +120,8 @@ async def create_jwt_token(
     secret: str = DEFAULT_SECRET,
     algorithm: str = DEFAULT_ALGO,
 ) -> str:
-    """Async facade for historic code. Internally synchronous—almost instant.
+    """
+    Async facade for historic code. Internally synchronous-almost instant.
 
     Args:
         data: Dictionary containing payload data to encode in the token.
@@ -105,6 +132,16 @@ async def create_jwt_token(
 
     Returns:
         The JWT token string.
+
+    Doctest:
+    >>> from mcpgateway.utils import create_jwt_token as jwt_util
+    >>> jwt_util.settings.jwt_secret_key = 'secret'
+    >>> jwt_util.settings.jwt_algorithm = 'HS256'
+    >>> import asyncio
+    >>> t = asyncio.run(jwt_util.create_jwt_token({'sub': 'bob'}, expires_in_minutes=1, secret='secret', algorithm='HS256'))
+    >>> import jwt
+    >>> jwt.decode(t, 'secret', algorithms=['HS256'])['sub'] == 'bob'
+    True
     """
     return _create_jwt_token(data, expires_in_minutes, secret, algorithm)
 
@@ -125,7 +162,7 @@ async def get_jwt_token() -> str:
 
 
 def _decode_jwt_token(token: str, algorithms: List[str] | None = None) -> Dict[str, Any]:
-    """Decode *without* signature verification—handy for inspection.
+    """Decode *without* signature verification-handy for inspection.
 
     Args:
         token: JWT token string to decode.
@@ -148,6 +185,35 @@ def _decode_jwt_token(token: str, algorithms: List[str] | None = None) -> Dict[s
 
 
 def _parse_args():
+    """Parse command line arguments for JWT token operations.
+
+    Sets up an argument parser with mutually exclusive options for:
+    - Creating tokens with username (-u/--username)
+    - Creating tokens with custom data (-d/--data)
+    - Decoding existing tokens (--decode)
+
+    Additional options control expiration, secret key, algorithm, and output format.
+
+    Returns:
+        argparse.Namespace: Parsed command line arguments containing:
+            - username: Optional username for simple payload
+            - data: Optional JSON or key=value pairs for custom payload
+            - decode: Optional token string to decode
+            - exp: Expiration time in minutes (default: DEFAULT_EXP_MINUTES)
+            - secret: Secret key for signing (default: DEFAULT_SECRET)
+            - algo: Signing algorithm (default: DEFAULT_ALGO)
+            - pretty: Whether to pretty-print payload before encoding
+
+    Examples:
+        >>> # Simulating command line args
+        >>> import sys
+        >>> sys.argv = ['jwt_cli.py', '-u', 'alice', '-e', '60']
+        >>> args = _parse_args()  # doctest: +SKIP
+        >>> args.username  # doctest: +SKIP
+        'alice'
+        >>> args.exp  # doctest: +SKIP
+        60
+    """
     p = argparse.ArgumentParser(
         description="Generate or inspect JSON Web Tokens.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -173,6 +239,44 @@ def _parse_args():
 
 
 def _payload_from_cli(args) -> Dict[str, Any]:
+    """Extract JWT payload from parsed command line arguments.
+
+    Processes arguments in priority order:
+    1. If username is specified, creates {"username": <value>}
+    2. If data is specified, parses as JSON or key=value pairs
+    3. Otherwise, returns default payload with admin username
+
+    The data argument supports two formats:
+    - JSON string: '{"key": "value", "foo": "bar"}'
+    - Comma-separated pairs: 'key=value,foo=bar'
+
+    Args:
+        args: Parsed command line arguments from argparse containing
+              username, data, and other JWT options.
+
+    Returns:
+        Dict[str, Any]: The payload dictionary to encode in the JWT.
+
+    Raises:
+        ValueError: If data contains invalid key=value pairs (missing '=').
+
+    Examples:
+        >>> from argparse import Namespace
+        >>> args = Namespace(username='alice', data=None)
+        >>> _payload_from_cli(args)
+        {'username': 'alice'}
+        >>> args = Namespace(username=None, data='{"role": "admin", "id": 123}')
+        >>> _payload_from_cli(args)
+        {'role': 'admin', 'id': 123}
+        >>> args = Namespace(username=None, data='name=bob,role=user')
+        >>> _payload_from_cli(args)
+        {'name': 'bob', 'role': 'user'}
+        >>> args = Namespace(username=None, data='invalid_format')
+        >>> _payload_from_cli(args)  # doctest: +ELLIPSIS
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid key=value pair: 'invalid_format'
+    """
     if args.username is not None:
         return {"username": args.username}
 
@@ -195,11 +299,56 @@ def _payload_from_cli(args) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Entry point for ``python jwt_cli.py``
+# Entry point for ``python3 jwt_cli.py``
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:  # pragma: no cover
+    """Entry point for JWT command line interface.
+
+    Provides two main modes of operation:
+    1. Token creation: Generates a new JWT with specified payload
+    2. Token decoding: Decodes and displays an existing JWT (without verification)
+
+    In creation mode, supports:
+    - Simple username payload (-u/--username)
+    - Custom JSON or key=value payload (-d/--data)
+    - Configurable expiration, secret, and algorithm
+    - Optional pretty-printing of payload before encoding
+
+    In decode mode, displays the decoded payload as formatted JSON.
+
+    The function handles being run in different contexts:
+    - Direct script execution: Runs synchronously
+    - Within existing asyncio loop: Delegates to executor to avoid blocking
+
+    Examples:
+        Command line usage::
+
+            # Create token with username
+            $ python jwt_cli.py -u alice
+            eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
+
+            # Create token with custom data
+            $ python jwt_cli.py -d '{"role": "admin", "dept": "IT"}'
+            eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
+
+            # Decode existing token
+            $ python jwt_cli.py --decode eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
+            {
+              "username": "alice",
+              "exp": 1234567890
+            }
+
+            # Pretty print payload before encoding
+            $ python jwt_cli.py -u bob --pretty
+            Payload:
+            {
+              "username": "bob"
+            }
+            -
+            eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
+    """
     args = _parse_args()
 
     # Decode mode takes precedence

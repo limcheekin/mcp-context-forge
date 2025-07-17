@@ -9,14 +9,17 @@ This module tests the admin UI routes for the MCP Gateway, ensuring
 they properly handle server, tool, resource, prompt, gateway and root management.
 """
 
+# Standard
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
+# Third-Party
 from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+import pytest
 from sqlalchemy.orm import Session
 
+# First-Party
 from mcpgateway.admin import (
     admin_add_gateway,
     admin_add_prompt,
@@ -56,12 +59,17 @@ from mcpgateway.admin import (
 from mcpgateway.services.gateway_service import GatewayService
 from mcpgateway.services.prompt_service import PromptService
 from mcpgateway.services.resource_service import ResourceService
-from mcpgateway.services.root_service import RootService
 from mcpgateway.services.server_service import ServerNotFoundError, ServerService
 from mcpgateway.services.tool_service import (
     ToolNameConflictError,
     ToolService,
 )
+
+
+class FakeForm(dict):
+    def getlist(self, key):
+        value = self.get(key, [])
+        return value if isinstance(value, list) else [value]
 
 
 @pytest.fixture
@@ -80,32 +88,34 @@ def mock_request():
 
     # Pretend form() returns the full set of fields our admin helpers expect
     request.form = AsyncMock(
-        return_value={
-            "name": "test-name",
-            "url": "http://example.com",
-            "description": "Test description",
-            "icon": "http://example.com/icon.png",
-            "uri": "/test/resource",
-            "mimeType": "text/plain",
-            "template": "Template content",
-            "content": "Test content",
-            "associatedTools": "1,2,3",
-            "associatedResources": "4,5",
-            "associatedPrompts": "6",
-            "requestType": "POST",
-            "integrationType": "MCP",
-            "headers": "{}",
-            "input_schema": "{}",
-            "jsonpath_filter": "$.",
-            "auth_type": "",
-            "auth_username": "",
-            "auth_password": "",
-            "auth_token": "",
-            "auth_header_key": "",
-            "auth_header_value": "",
-            "arguments": "[]",
-            "activate": "true",
-        }
+        return_value=FakeForm(
+            {
+                "name": "test-name",
+                "url": "http://example.com",
+                "description": "Test description",
+                "icon": "http://example.com/icon.png",
+                "uri": "/test/resource",
+                "mimeType": "text/plain",
+                "template": "Template content",
+                "content": "Test content",
+                "associatedTools": ["1", "2", "3"],
+                "associatedResources": "4,5",
+                "associatedPrompts": "6",
+                "requestType": "SSE",
+                "integrationType": "MCP",
+                "headers": "{}",
+                "input_schema": "{}",
+                "jsonpath_filter": "$.",
+                "auth_type": "",
+                "auth_username": "",
+                "auth_password": "",
+                "auth_token": "",
+                "auth_header_key": "",
+                "auth_header_value": "",
+                "arguments": "[]",
+                "activate": "true",
+            }
+        )
     )
 
     # Basic template rendering stub
@@ -126,9 +136,9 @@ class TestAdminServerRoutes:
         """Test listing servers through admin UI."""
         # Setup
         mock_server1 = MagicMock()
-        mock_server1.dict.return_value = {"id": 1, "name": "Server 1"}
+        mock_server1.model_dump.return_value = {"id": 1, "name": "Server 1"}
         mock_server2 = MagicMock()
-        mock_server2.dict.return_value = {"id": 2, "name": "Server 2"}
+        mock_server2.model_dump.return_value = {"id": 2, "name": "Server 2"}
         mock_list_servers.return_value = [mock_server1, mock_server2]
 
         # Execute
@@ -145,15 +155,15 @@ class TestAdminServerRoutes:
         """Test getting a single server through admin UI."""
         # Setup
         mock_server = MagicMock()
-        mock_server.dict.return_value = {"id": 1, "name": "Server 1"}
+        mock_server.model_dump.return_value = {"id": "1", "name": "Server 1"}
         mock_get_server.return_value = mock_server
 
         # Execute
-        result = await admin_get_server(1, mock_db, "test-user")
+        result = await admin_get_server("1", mock_db, "test-user")
 
         # Assert
-        mock_get_server.assert_called_once_with(mock_db, 1)
-        assert result == {"id": 1, "name": "Server 1"}
+        mock_get_server.assert_called_once_with(mock_db, "1")
+        assert result == {"id": "1", "name": "Server 1"}
 
     @patch.object(ServerService, "get_server")
     async def test_admin_get_server_not_found(self, mock_get_server, mock_db):
@@ -172,6 +182,8 @@ class TestAdminServerRoutes:
     async def test_admin_add_server(self, mock_register_server, mock_request, mock_db):
         """Test adding a server through admin UI."""
         # Execute
+        form = await mock_request.form()
+        print(f'{form.getlist("associatedTools")=}')
         result = await admin_add_server(mock_request, mock_db, "test-user")
 
         # Assert
@@ -223,9 +235,9 @@ class TestAdminToolRoutes:
         """Test listing tools through admin UI."""
         # Setup
         mock_tool1 = MagicMock()
-        mock_tool1.dict.return_value = {"id": 1, "name": "Tool 1"}
+        mock_tool1.model_dump.return_value = {"id": 1, "name": "Tool 1"}
         mock_tool2 = MagicMock()
-        mock_tool2.dict.return_value = {"id": 2, "name": "Tool 2"}
+        mock_tool2.model_dump.return_value = {"id": 2, "name": "Tool 2"}
         mock_list_tools.return_value = [mock_tool1, mock_tool2]
 
         # Execute
@@ -242,15 +254,15 @@ class TestAdminToolRoutes:
         """Test getting a single tool through admin UI."""
         # Setup
         mock_tool = MagicMock()
-        mock_tool.dict.return_value = {"id": 1, "name": "Tool 1"}
+        mock_tool.model_dump.return_value = {"id": "1", "name": "Tool 1"}
         mock_get_tool.return_value = mock_tool
 
         # Execute
-        result = await admin_get_tool(1, mock_db, "test-user")
+        result = await admin_get_tool("1", mock_db, "test-user")
 
         # Assert
-        mock_get_tool.assert_called_once_with(mock_db, 1)
-        assert result == {"id": 1, "name": "Tool 1"}
+        mock_get_tool.assert_called_once_with(mock_db, "1")
+        assert result == {"id": "1", "name": "Tool 1"}
 
     @patch.object(ToolService, "register_tool")
     async def test_admin_add_tool(self, mock_register_tool, mock_request, mock_db):
@@ -311,7 +323,7 @@ class TestAdminToolRoutes:
         result = await admin_toggle_tool(1, mock_request, mock_db, "test-user")
 
         # Assert
-        mock_toggle_status.assert_called_once_with(mock_db, 1, True)
+        mock_toggle_status.assert_called_once_with(mock_db, 1, True, reachable=True)
         assert isinstance(result, RedirectResponse)
         assert result.status_code == 303
         assert "/admin#tools" in result.headers["location"]
@@ -335,9 +347,9 @@ class TestAdminResourceRoutes:
         """Test listing resources through admin UI."""
         # Setup
         mock_resource1 = MagicMock()
-        mock_resource1.dict.return_value = {"id": 1, "name": "Resource 1"}
+        mock_resource1.model_dump.return_value = {"id": 1, "name": "Resource 1"}
         mock_resource2 = MagicMock()
-        mock_resource2.dict.return_value = {"id": 2, "name": "Resource 2"}
+        mock_resource2.model_dump.return_value = {"id": 2, "name": "Resource 2"}
         mock_list_resources.return_value = [mock_resource1, mock_resource2]
 
         # Execute
@@ -355,7 +367,7 @@ class TestAdminResourceRoutes:
         """Test getting a single resource through admin UI."""
         # Setup
         mock_resource = MagicMock()
-        mock_resource.dict.return_value = {"id": 1, "name": "Resource 1"}
+        mock_resource.model_dump.return_value = {"id": 1, "name": "Resource 1"}
         mock_get_resource.return_value = mock_resource
         mock_read_resource.return_value = {"type": "resource", "text": "content"}
 
@@ -423,9 +435,9 @@ class TestAdminPromptRoutes:
         """Test listing prompts through admin UI."""
         # Setup
         mock_prompt1 = MagicMock()
-        mock_prompt1.dict.return_value = {"id": 1, "name": "Prompt 1"}
+        mock_prompt1.model_dump.return_value = {"id": 1, "name": "Prompt 1"}
         mock_prompt2 = MagicMock()
-        mock_prompt2.dict.return_value = {"id": 2, "name": "Prompt 2"}
+        mock_prompt2.model_dump.return_value = {"id": 2, "name": "Prompt 2"}
         mock_list_prompts.return_value = [mock_prompt1, mock_prompt2]
 
         # Execute
@@ -525,9 +537,9 @@ class TestAdminGatewayRoutes:
         """Test listing gateways through admin UI."""
         # Setup
         mock_gateway1 = MagicMock()
-        mock_gateway1.dict.return_value = {"id": 1, "name": "Gateway 1"}
+        mock_gateway1.model_dump.return_value = {"id": 1, "name": "Gateway 1"}
         mock_gateway2 = MagicMock()
-        mock_gateway2.dict.return_value = {"id": 2, "name": "Gateway 2"}
+        mock_gateway2.model_dump.return_value = {"id": 2, "name": "Gateway 2"}
         mock_list_gateways.return_value = [mock_gateway1, mock_gateway2]
 
         # Execute
@@ -544,7 +556,7 @@ class TestAdminGatewayRoutes:
         """Test getting a single gateway through admin UI."""
         # Setup
         mock_gateway = MagicMock()
-        mock_gateway.dict.return_value = {"id": 1, "name": "Gateway 1"}
+        mock_gateway.model_dump.return_value = {"id": 1, "name": "Gateway 1"}
         mock_get_gateway.return_value = mock_gateway
 
         # Execute
@@ -562,9 +574,8 @@ class TestAdminGatewayRoutes:
 
         # Assert
         mock_register_gateway.assert_called_once()
-        assert isinstance(result, RedirectResponse)
-        assert result.status_code == 303
-        assert "/admin#gateways" in result.headers["location"]
+        assert isinstance(result, JSONResponse)
+        assert result.status_code == 200
 
     @patch.object(GatewayService, "update_gateway")
     async def test_admin_edit_gateway(self, mock_update_gateway, mock_request, mock_db):
@@ -585,6 +596,8 @@ class TestAdminGatewayRoutes:
         result = await admin_toggle_gateway(1, mock_request, mock_db, "test-user")
 
         # Assert
+        print("ACTUAL CALL:", mock_toggle_status.call_args)
+
         mock_toggle_status.assert_called_once_with(mock_db, 1, True)
         assert isinstance(result, RedirectResponse)
         assert result.status_code == 303

@@ -27,12 +27,13 @@ Environment variables:
 Example:
     $ export MCPGATEWAY_BEARER_TOKEN=$(python3 -m mcpgateway.utils.create_jwt_token --username admin --exp 10080 --secret my-test-key)
     $ export MCP_AUTH_TOKEN=${MCPGATEWAY_BEARER_TOKEN}
-    $ export MCP_SERVER_CATALOG_URLS='http://localhost:4444/servers/1'
+    $ export MCP_SERVER_CATALOG_URLS='http://localhost:4444/servers/UUID_OF_SERVER_1'
     $ export MCP_TOOL_CALL_TIMEOUT=120
     $ export MCP_WRAPPER_LOG_LEVEL=DEBUG # OFF to disable logging
     $ python3 -m mcpgateway.wrapper
 """
 
+# Standard
 import asyncio
 import logging
 import os
@@ -40,20 +41,23 @@ import sys
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
+# Third-Party
 import httpx
-import mcp.server.stdio
 from mcp import types
 from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
+import mcp.server.stdio
 from pydantic import AnyUrl
 
+# First-Party
 from mcpgateway import __version__
+from mcpgateway.utils.retry_manager import ResilientHttpClient
 
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
 ENV_SERVER_CATALOGS = "MCP_SERVER_CATALOG_URLS"
-ENV_AUTH_TOKEN = "MCP_AUTH_TOKEN"  # nosec B105 – this is an *environment variable name*, not a secret
+ENV_AUTH_TOKEN = "MCP_AUTH_TOKEN"  # nosec B105 - this is an *environment variable name*, not a secret
 ENV_TIMEOUT = "MCP_TOOL_CALL_TIMEOUT"
 ENV_LOG_LEVEL = "MCP_WRAPPER_LOG_LEVEL"
 
@@ -63,8 +67,8 @@ SERVER_CATALOG_URLS: List[str] = [u.strip() for u in RAW_CATALOGS.split(",") if 
 AUTH_TOKEN: str = os.getenv(ENV_AUTH_TOKEN, "")
 TOOL_CALL_TIMEOUT: int = int(os.getenv(ENV_TIMEOUT, "90"))
 
-# Validate required configuration
-if not SERVER_CATALOG_URLS:
+# Validate required configuration (only when run as script)
+if __name__ == "__main__" and not SERVER_CATALOG_URLS:
     print(f"Error: {ENV_SERVER_CATALOGS} environment variable is required", file=sys.stderr)
     sys.exit(1)
 
@@ -82,20 +86,20 @@ def _extract_base_url(url: str) -> str:
 
     Args:
         url (str): Full catalog URL, e.g.
-            `https://host.com/gateway/servers/1`.
+            `https://host.com/gateway/servers/UUID_OF_SERVER_1`.
 
     Returns:
         str: Clean base URL suitable for building `/tools/`, `/prompts/`,
-        or `/resources/` endpoints—for example
+        or `/resources/` endpoints-for example
         `https://host.com/gateway`.
 
     Raises:
         ValueError: If *url* lacks a scheme or network location.
 
     Examples:
-        >>> _extract_base_url("https://host.com/servers/2")
+        >>> _extract_base_url("https://host.com/servers/UUID_OF_SERVER_2")
         'https://host.com'
-        >>> _extract_base_url("https://host.com/gateway/servers/2")
+        >>> _extract_base_url("https://host.com/gateway/servers/UUID_OF_SERVER_2")
         'https://host.com/gateway'
         >>> _extract_base_url("https://host.com/gateway/servers")
         'https://host.com/gateway'
@@ -113,7 +117,7 @@ def _extract_base_url(url: str) -> str:
 
     path = parsed.path or ""
     if "/servers/" in path:
-        path = path.split("/servers")[0]  # ".../servers/123" -> "..."
+        path = path.split("/servers")[0]  # ".../servers/UUID_OF_SERVER_123" -> "..."
     elif path.endswith("/servers"):
         path = path[: -len("/servers")]  # ".../servers"     -> "..."
     # otherwise keep the existing path (supports APP_ROOT_PATH)
@@ -158,7 +162,7 @@ async def fetch_url(url: str) -> httpx.Response:
         httpx.HTTPStatusError: If the server returns a 4xx or 5xx response.
     """
     headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
-    async with httpx.AsyncClient(timeout=TOOL_CALL_TIMEOUT) as client:
+    async with ResilientHttpClient(client_args={"timeout": TOOL_CALL_TIMEOUT}) as client:
         try:
             response = await client.get(url, headers=headers)
             response.raise_for_status()
@@ -213,7 +217,7 @@ async def tools_metadata(tool_ids: List[str]) -> List[Dict[str, Any]]:
     if tool_ids == ["0"]:
         return data
 
-    return [tool for tool in data if tool["id"] in tool_ids]
+    return [tool for tool in data if tool["name"] in tool_ids]
 
 
 async def get_prompts_from_mcp_server(catalog_urls: List[str]) -> List[str]:
@@ -330,6 +334,7 @@ async def handle_list_tools() -> List[types.Tool]:
                         name=str(tool_name),
                         description=tool.get("description", ""),
                         inputSchema=tool.get("inputSchema", {}),
+                        annotations=tool.get("annotations", {}),
                     )
                 )
         return tools
@@ -363,7 +368,7 @@ async def handle_call_tool(name: str, arguments: Optional[Dict[str, Any]] = None
     headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
 
     try:
-        async with httpx.AsyncClient(timeout=TOOL_CALL_TIMEOUT) as client:
+        async with ResilientHttpClient(client_args={"timeout": TOOL_CALL_TIMEOUT}) as client:
             resp = await client.post(f"{BASE_URL}/rpc/", json=payload, headers=headers)
             resp.raise_for_status()
             result = resp.json()
@@ -494,9 +499,6 @@ async def handle_get_prompt(name: str, arguments: Optional[Dict[str, str]] = Non
 
     Raises:
         ValueError: If fetching or formatting fails.
-
-    Example:
-        >>> await handle_get_prompt("greet", {"username": "Alice"})
     """
     try:
         url = f"{BASE_URL}/prompts/{name}"

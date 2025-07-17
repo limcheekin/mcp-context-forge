@@ -17,19 +17,28 @@ various services to perform the actual business logic operations on the
 underlying data.
 """
 
+# Standard
 import json
 import logging
+import time
 from typing import Any, Dict, List, Union
 
+# Third-Party
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+import httpx
+from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+# First-Party
 from mcpgateway.config import settings
 from mcpgateway.db import get_db
 from mcpgateway.schemas import (
     GatewayCreate,
     GatewayRead,
+    GatewayTestRequest,
+    GatewayTestResponse,
     GatewayUpdate,
     PromptCreate,
     PromptMetrics,
@@ -59,6 +68,8 @@ from mcpgateway.services.tool_service import (
     ToolService,
 )
 from mcpgateway.utils.create_jwt_token import get_jwt_token
+from mcpgateway.utils.error_formatter import ErrorFormatter
+from mcpgateway.utils.retry_manager import ResilientHttpClient
 from mcpgateway.utils.verify_credentials import require_auth, require_basic_auth
 
 # Initialize services
@@ -98,16 +109,16 @@ async def admin_list_servers(
     """
     logger.debug(f"User {user} requested server list")
     servers = await server_service.list_servers(db, include_inactive=include_inactive)
-    return [server.dict(by_alias=True) for server in servers]
+    return [server.model_dump(by_alias=True) for server in servers]
 
 
 @admin_router.get("/servers/{server_id}", response_model=ServerRead)
-async def admin_get_server(server_id: int, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> ServerRead:
+async def admin_get_server(server_id: str, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> ServerRead:
     """
     Retrieve server details for the admin UI.
 
     Args:
-        server_id (int): The ID of the server to retrieve.
+        server_id (str): The ID of the server to retrieve.
         db (Session): The database session dependency.
         user (str): The authenticated user dependency.
 
@@ -120,7 +131,7 @@ async def admin_get_server(server_id: int, db: Session = Depends(get_db), user: 
     try:
         logger.debug(f"User {user} requested details for server ID {server_id}")
         server = await server_service.get_server(db, server_id)
-        return server.dict(by_alias=True)
+        return server.model_dump(by_alias=True)
     except ServerNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -151,30 +162,36 @@ async def admin_add_server(request: Request, db: Session = Depends(get_db), user
         RedirectResponse: A redirect to the admin dashboard catalog section
     """
     form = await request.form()
+    is_inactive_checked = form.get("is_inactive_checked", "false")
     try:
         logger.debug(f"User {user} is adding a new server with name: {form['name']}")
+
         server = ServerCreate(
-            name=form["name"],
+            name=form.get("name"),
             description=form.get("description"),
             icon=form.get("icon"),
-            associated_tools=form.get("associatedTools"),
+            associated_tools=",".join(form.getlist("associatedTools")),
             associated_resources=form.get("associatedResources"),
             associated_prompts=form.get("associatedPrompts"),
         )
         await server_service.register_server(db, server)
 
         root_path = request.scope.get("root_path", "")
+        if is_inactive_checked.lower() == "true":
+            return RedirectResponse(f"{root_path}/admin/?include_inactive=true#catalog", status_code=303)
         return RedirectResponse(f"{root_path}/admin#catalog", status_code=303)
     except Exception as e:
         logger.error(f"Error adding server: {e}")
 
         root_path = request.scope.get("root_path", "")
+        if is_inactive_checked.lower() == "true":
+            return RedirectResponse(f"{root_path}/admin/?include_inactive=true#catalog", status_code=303)
         return RedirectResponse(f"{root_path}/admin#catalog", status_code=303)
 
 
 @admin_router.post("/servers/{server_id}/edit")
 async def admin_edit_server(
-    server_id: int,
+    server_id: str,
     request: Request,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -195,7 +212,7 @@ async def admin_edit_server(
       - associatedPrompts (optional, comma-separated): Updated list of prompts associated with this server
 
     Args:
-        server_id (int): The ID of the server to edit
+        server_id (str): The ID of the server to edit
         request (Request): FastAPI request containing form data
         db (Session): Database session dependency
         user (str): Authenticated user dependency
@@ -204,30 +221,36 @@ async def admin_edit_server(
         RedirectResponse: A redirect to the admin dashboard catalog section with a status code of 303
     """
     form = await request.form()
+    is_inactive_checked = form.get("is_inactive_checked", "false")
     try:
         logger.debug(f"User {user} is editing server ID {server_id} with name: {form.get('name')}")
         server = ServerUpdate(
             name=form.get("name"),
             description=form.get("description"),
             icon=form.get("icon"),
-            associated_tools=form.get("associatedTools"),
+            associated_tools=",".join(form.getlist("associatedTools")),
             associated_resources=form.get("associatedResources"),
             associated_prompts=form.get("associatedPrompts"),
         )
         await server_service.update_server(db, server_id, server)
 
         root_path = request.scope.get("root_path", "")
+
+        if is_inactive_checked.lower() == "true":
+            return RedirectResponse(f"{root_path}/admin/?include_inactive=true#catalog", status_code=303)
         return RedirectResponse(f"{root_path}/admin#catalog", status_code=303)
     except Exception as e:
         logger.error(f"Error editing server: {e}")
 
         root_path = request.scope.get("root_path", "")
+        if is_inactive_checked.lower() == "true":
+            return RedirectResponse(f"{root_path}/admin/?include_inactive=true#catalog", status_code=303)
         return RedirectResponse(f"{root_path}/admin#catalog", status_code=303)
 
 
 @admin_router.post("/servers/{server_id}/toggle")
 async def admin_toggle_server(
-    server_id: int,
+    server_id: str,
     request: Request,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -241,7 +264,7 @@ async def admin_toggle_server(
     logs any errors that might occur during the status toggle operation.
 
     Args:
-        server_id (int): The ID of the server whose status to toggle.
+        server_id (str): The ID of the server whose status to toggle.
         request (Request): FastAPI request containing form data with the 'activate' field.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
@@ -253,17 +276,20 @@ async def admin_toggle_server(
     form = await request.form()
     logger.debug(f"User {user} is toggling server ID {server_id} with activate: {form.get('activate')}")
     activate = form.get("activate", "true").lower() == "true"
+    is_inactive_checked = form.get("is_inactive_checked", "false")
     try:
         await server_service.toggle_server_status(db, server_id, activate)
     except Exception as e:
         logger.error(f"Error toggling server status: {e}")
 
     root_path = request.scope.get("root_path", "")
+    if is_inactive_checked.lower() == "true":
+        return RedirectResponse(f"{root_path}/admin/?include_inactive=true#catalog", status_code=303)
     return RedirectResponse(f"{root_path}/admin#catalog", status_code=303)
 
 
 @admin_router.post("/servers/{server_id}/delete")
-async def admin_delete_server(server_id: int, request: Request, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> RedirectResponse:
+async def admin_delete_server(server_id: str, request: Request, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> RedirectResponse:
     """
     Delete a server via the admin UI.
 
@@ -271,7 +297,7 @@ async def admin_delete_server(server_id: int, request: Request, db: Session = De
     gracefully and logs any errors that occur during the deletion process.
 
     Args:
-        server_id (int): The ID of the server to delete
+        server_id (str): The ID of the server to delete
         request (Request): FastAPI request object (not used but required by route signature).
         db (Session): Database session dependency
         user (str): Authenticated user dependency
@@ -286,7 +312,12 @@ async def admin_delete_server(server_id: int, request: Request, db: Session = De
     except Exception as e:
         logger.error(f"Error deleting server: {e}")
 
+    form = await request.form()
+    is_inactive_checked = form.get("is_inactive_checked", "false")
     root_path = request.scope.get("root_path", "")
+
+    if is_inactive_checked.lower() == "true":
+        return RedirectResponse(f"{root_path}/admin/?include_inactive=true#catalog", status_code=303)
     return RedirectResponse(f"{root_path}/admin#catalog", status_code=303)
 
 
@@ -313,7 +344,7 @@ async def admin_list_resources(
     """
     logger.debug(f"User {user} requested resource list")
     resources = await resource_service.list_resources(db, include_inactive=include_inactive)
-    return [resource.dict(by_alias=True) for resource in resources]
+    return [resource.model_dump(by_alias=True) for resource in resources]
 
 
 @admin_router.get("/prompts", response_model=List[PromptRead])
@@ -339,7 +370,7 @@ async def admin_list_prompts(
     """
     logger.debug(f"User {user} requested prompt list")
     prompts = await prompt_service.list_prompts(db, include_inactive=include_inactive)
-    return [prompt.dict(by_alias=True) for prompt in prompts]
+    return [prompt.model_dump(by_alias=True) for prompt in prompts]
 
 
 @admin_router.get("/gateways", response_model=List[GatewayRead])
@@ -365,12 +396,12 @@ async def admin_list_gateways(
     """
     logger.debug(f"User {user} requested gateway list")
     gateways = await gateway_service.list_gateways(db, include_inactive=include_inactive)
-    return [gateway.dict(by_alias=True) for gateway in gateways]
+    return [gateway.model_dump(by_alias=True) for gateway in gateways]
 
 
 @admin_router.post("/gateways/{gateway_id}/toggle")
 async def admin_toggle_gateway(
-    gateway_id: int,
+    gateway_id: str,
     request: Request,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -383,7 +414,7 @@ async def admin_toggle_gateway(
     determine the new status of the gateway.
 
     Args:
-        gateway_id (int): The ID of the gateway to toggle.
+        gateway_id (str): The ID of the gateway to toggle.
         request (Request): The FastAPI request object containing form data.
         db (Session): The database session dependency.
         user (str): The authenticated user dependency.
@@ -395,12 +426,16 @@ async def admin_toggle_gateway(
     logger.debug(f"User {user} is toggling gateway ID {gateway_id}")
     form = await request.form()
     activate = form.get("activate", "true").lower() == "true"
+    is_inactive_checked = form.get("is_inactive_checked", "false")
+
     try:
         await gateway_service.toggle_gateway_status(db, gateway_id, activate)
     except Exception as e:
         logger.error(f"Error toggling gateway status: {e}")
 
     root_path = request.scope.get("root_path", "")
+    if is_inactive_checked.lower() == "true":
+        return RedirectResponse(f"{root_path}/admin/?include_inactive=true#gateways", status_code=303)
     return RedirectResponse(f"{root_path}/admin#gateways", status_code=303)
 
 
@@ -433,14 +468,15 @@ async def admin_ui(
         HTMLResponse: Rendered HTML template for the admin dashboard.
     """
     logger.debug(f"User {user} accessed the admin UI")
-    servers = [server.dict(by_alias=True) for server in await server_service.list_servers(db, include_inactive=include_inactive)]
-    tools = [tool.dict(by_alias=True) for tool in await tool_service.list_tools(db, include_inactive=include_inactive)]
-    resources = [resource.dict(by_alias=True) for resource in await resource_service.list_resources(db, include_inactive=include_inactive)]
-    prompts = [prompt.dict(by_alias=True) for prompt in await prompt_service.list_prompts(db, include_inactive=include_inactive)]
-    gateways = [gateway.dict(by_alias=True) for gateway in await gateway_service.list_gateways(db, include_inactive=include_inactive)]
-    roots = [root.dict(by_alias=True) for root in await root_service.list_roots()]
+    servers = [server.model_dump(by_alias=True) for server in await server_service.list_servers(db, include_inactive=include_inactive)]
+    tools = [tool.model_dump(by_alias=True) for tool in await tool_service.list_tools(db, include_inactive=include_inactive)]
+    resources = [resource.model_dump(by_alias=True) for resource in await resource_service.list_resources(db, include_inactive=include_inactive)]
+    prompts = [prompt.model_dump(by_alias=True) for prompt in await prompt_service.list_prompts(db, include_inactive=include_inactive)]
+    gateways = [gateway.model_dump(by_alias=True) for gateway in await gateway_service.list_gateways(db, include_inactive=include_inactive)]
+    roots = [root.model_dump(by_alias=True) for root in await root_service.list_roots()]
     root_path = settings.app_root_path
     response = request.app.state.templates.TemplateResponse(
+        request,
         "admin.html",
         {
             "request": request,
@@ -452,6 +488,7 @@ async def admin_ui(
             "roots": roots,
             "include_inactive": include_inactive,
             "root_path": root_path,
+            "gateway_tool_name_separator": settings.gateway_tool_name_separator,
         },
     )
 
@@ -482,11 +519,11 @@ async def admin_list_tools(
     """
     logger.debug(f"User {user} requested tool list")
     tools = await tool_service.list_tools(db, include_inactive=include_inactive)
-    return [tool.dict(by_alias=True) for tool in tools]
+    return [tool.model_dump(by_alias=True) for tool in tools]
 
 
 @admin_router.get("/tools/{tool_id}", response_model=ToolRead)
-async def admin_get_tool(tool_id: int, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> ToolRead:
+async def admin_get_tool(tool_id: str, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> ToolRead:
     """
     Retrieve specific tool details for the admin UI.
 
@@ -495,7 +532,7 @@ async def admin_get_tool(tool_id: int, db: Session = Depends(get_db), user: str 
     viewing and management purposes.
 
     Args:
-        tool_id (int): The ID of the tool to retrieve.
+        tool_id (str): The ID of the tool to retrieve.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
 
@@ -504,7 +541,7 @@ async def admin_get_tool(tool_id: int, db: Session = Depends(get_db), user: str 
     """
     logger.debug(f"User {user} requested details for tool ID {tool_id}")
     tool = await tool_service.get_tool(db, tool_id)
-    return tool.dict(by_alias=True)
+    return tool.model_dump(by_alias=True)
 
 
 @admin_router.post("/tools/")
@@ -566,7 +603,7 @@ async def admin_add_tool(
     logger.debug(f"Tool data built: {tool_data}")
     try:
         tool = ToolCreate(**tool_data)
-        logger.debug(f"Validated tool data: {tool.dict()}")
+        logger.debug(f"Validated tool data: {tool.model_dump(by_alias=True)}")
         await tool_service.register_tool(db, tool)
         return JSONResponse(
             content={"message": "Tool registered successfully!", "success": True},
@@ -583,7 +620,7 @@ async def admin_add_tool(
 @admin_router.post("/tools/{tool_id}/edit/")
 @admin_router.post("/tools/{tool_id}/edit")
 async def admin_edit_tool(
-    tool_id: int,
+    tool_id: str,
     request: Request,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -611,7 +648,7 @@ async def admin_edit_tool(
     snake-case keys expected by the schemas.
 
     Args:
-        tool_id (int): The ID of the tool to edit.
+        tool_id (str): The ID of the tool to edit.
         request (Request): FastAPI request containing form data.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
@@ -639,12 +676,15 @@ async def admin_edit_tool(
         "auth_header_key": form.get("auth_header_key", ""),
         "auth_header_value": form.get("auth_header_value", ""),
     }
-    logger.info(f"Tool update data built: {tool_data}")
+    logger.debug(f"Tool update data built: {tool_data}")
     tool = ToolUpdate(**tool_data)
     try:
         await tool_service.update_tool(db, tool_id, tool)
 
         root_path = request.scope.get("root_path", "")
+        is_inactive_checked = form.get("is_inactive_checked", "false")
+        if is_inactive_checked.lower() == "true":
+            return RedirectResponse(f"{root_path}/admin/?include_inactive=true#tools", status_code=303)
         return RedirectResponse(f"{root_path}/admin#tools", status_code=303)
     except ToolNameConflictError as e:
         return JSONResponse(content={"message": str(e), "success": False}, status_code=400)
@@ -653,7 +693,7 @@ async def admin_edit_tool(
 
 
 @admin_router.post("/tools/{tool_id}/delete")
-async def admin_delete_tool(tool_id: int, request: Request, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> RedirectResponse:
+async def admin_delete_tool(tool_id: str, request: Request, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> RedirectResponse:
     """
     Delete a tool via the admin UI.
 
@@ -662,7 +702,7 @@ async def admin_delete_tool(tool_id: int, request: Request, db: Session = Depend
     and the user must be authenticated to access this route.
 
     Args:
-        tool_id (int): The ID of the tool to delete.
+        tool_id (str): The ID of the tool to delete.
         request (Request): FastAPI request object (not used directly, but required by route signature).
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
@@ -674,13 +714,18 @@ async def admin_delete_tool(tool_id: int, request: Request, db: Session = Depend
     logger.debug(f"User {user} is deleting tool ID {tool_id}")
     await tool_service.delete_tool(db, tool_id)
 
+    form = await request.form()
+    is_inactive_checked = form.get("is_inactive_checked", "false")
     root_path = request.scope.get("root_path", "")
+
+    if is_inactive_checked.lower() == "true":
+        return RedirectResponse(f"{root_path}/admin/?include_inactive=true#tools", status_code=303)
     return RedirectResponse(f"{root_path}/admin#tools", status_code=303)
 
 
 @admin_router.post("/tools/{tool_id}/toggle")
 async def admin_toggle_tool(
-    tool_id: int,
+    tool_id: str,
     request: Request,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -694,7 +739,7 @@ async def admin_toggle_tool(
     logs any errors that might occur during the status toggle operation.
 
     Args:
-        tool_id (int): The ID of the tool whose status to toggle.
+        tool_id (str): The ID of the tool whose status to toggle.
         request (Request): FastAPI request containing form data with the 'activate' field.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
@@ -706,17 +751,20 @@ async def admin_toggle_tool(
     logger.debug(f"User {user} is toggling tool ID {tool_id}")
     form = await request.form()
     activate = form.get("activate", "true").lower() == "true"
+    is_inactive_checked = form.get("is_inactive_checked", "false")
     try:
-        await tool_service.toggle_tool_status(db, tool_id, activate)
+        await tool_service.toggle_tool_status(db, tool_id, activate, reachable=activate)
     except Exception as e:
         logger.error(f"Error toggling tool status: {e}")
 
     root_path = request.scope.get("root_path", "")
+    if is_inactive_checked.lower() == "true":
+        return RedirectResponse(f"{root_path}/admin/?include_inactive=true#tools", status_code=303)
     return RedirectResponse(f"{root_path}/admin#tools", status_code=303)
 
 
 @admin_router.get("/gateways/{gateway_id}", response_model=GatewayRead)
-async def admin_get_gateway(gateway_id: int, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> GatewayRead:
+async def admin_get_gateway(gateway_id: str, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> GatewayRead:
     """Get gateway details for the admin UI.
 
     Args:
@@ -729,11 +777,11 @@ async def admin_get_gateway(gateway_id: int, db: Session = Depends(get_db), user
     """
     logger.debug(f"User {user} requested details for gateway ID {gateway_id}")
     gateway = await gateway_service.get_gateway(db, gateway_id)
-    return gateway.dict(by_alias=True)
+    return gateway.model_dump(by_alias=True)
 
 
 @admin_router.post("/gateways")
-async def admin_add_gateway(request: Request, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> RedirectResponse:
+async def admin_add_gateway(request: Request, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> JSONResponse:
     """Add a gateway via the admin UI.
 
     Expects form fields:
@@ -763,24 +811,31 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
         auth_header_key=form.get("auth_header_key", ""),
         auth_header_value=form.get("auth_header_value", ""),
     )
-    root_path = request.scope.get("root_path", "")
+
     try:
         await gateway_service.register_gateway(db, gateway)
-        return RedirectResponse(f"{root_path}/admin#gateways", status_code=303)
+        return JSONResponse(
+            content={"message": "Gateway registered successfully!", "success": True},
+            status_code=200,
+        )
+
     except Exception as ex:
         if isinstance(ex, GatewayConnectionError):
-            return RedirectResponse(f"{root_path}/admin#gateways", status_code=502)
+            return JSONResponse(content={"message": str(ex), "success": False}, status_code=502)
         if isinstance(ex, ValueError):
-            return RedirectResponse(f"{root_path}/admin#gateways", status_code=400)
+            return JSONResponse(content={"message": str(ex), "success": False}, status_code=400)
         if isinstance(ex, RuntimeError):
-            return RedirectResponse(f"{root_path}/admin#gateways", status_code=500)
-
-        return RedirectResponse(f"{root_path}/admin#gateways", status_code=500)
+            return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        if isinstance(ex, ValidationError):
+            return JSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
+        if isinstance(ex, IntegrityError):
+            return JSONResponse(status_code=409, content=ErrorFormatter.format_database_error(ex))
+        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
 
 @admin_router.post("/gateways/{gateway_id}/edit")
 async def admin_edit_gateway(
-    gateway_id: int,
+    gateway_id: str,
     request: Request,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -818,11 +873,15 @@ async def admin_edit_gateway(
     await gateway_service.update_gateway(db, gateway_id, gateway)
 
     root_path = request.scope.get("root_path", "")
+    is_inactive_checked = form.get("is_inactive_checked", "false")
+
+    if is_inactive_checked.lower() == "true":
+        return RedirectResponse(f"{root_path}/admin/?include_inactive=true#gateways", status_code=303)
     return RedirectResponse(f"{root_path}/admin#gateways", status_code=303)
 
 
 @admin_router.post("/gateways/{gateway_id}/delete")
-async def admin_delete_gateway(gateway_id: int, request: Request, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> RedirectResponse:
+async def admin_delete_gateway(gateway_id: str, request: Request, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> RedirectResponse:
     """
     Delete a gateway via the admin UI.
 
@@ -831,7 +890,7 @@ async def admin_delete_gateway(gateway_id: int, request: Request, db: Session = 
     operation for auditing purposes.
 
     Args:
-        gateway_id (int): The ID of the gateway to delete.
+        gateway_id (str): The ID of the gateway to delete.
         request (Request): FastAPI request object (not used directly but required by the route signature).
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
@@ -843,7 +902,12 @@ async def admin_delete_gateway(gateway_id: int, request: Request, db: Session = 
     logger.debug(f"User {user} is deleting gateway ID {gateway_id}")
     await gateway_service.delete_gateway(db, gateway_id)
 
+    form = await request.form()
+    is_inactive_checked = form.get("is_inactive_checked", "false")
     root_path = request.scope.get("root_path", "")
+
+    if is_inactive_checked.lower() == "true":
+        return RedirectResponse(f"{root_path}/admin/?include_inactive=true#gateways", status_code=303)
     return RedirectResponse(f"{root_path}/admin#gateways", status_code=303)
 
 
@@ -862,7 +926,7 @@ async def admin_get_resource(uri: str, db: Session = Depends(get_db), user: str 
     logger.debug(f"User {user} requested details for resource URI {uri}")
     resource = await resource_service.get_resource_by_uri(db, uri)
     content = await resource_service.read_resource(db, uri)
-    return {"resource": resource.dict(by_alias=True), "content": content}
+    return {"resource": resource.model_dump(by_alias=True), "content": content}
 
 
 @admin_router.post("/resources")
@@ -935,6 +999,10 @@ async def admin_edit_resource(
     await resource_service.update_resource(db, uri, resource)
 
     root_path = request.scope.get("root_path", "")
+    is_inactive_checked = form.get("is_inactive_checked", "false")
+
+    if is_inactive_checked.lower() == "true":
+        return RedirectResponse(f"{root_path}/admin/?include_inactive=true#resources", status_code=303)
     return RedirectResponse(f"{root_path}/admin#resources", status_code=303)
 
 
@@ -960,7 +1028,12 @@ async def admin_delete_resource(uri: str, request: Request, db: Session = Depend
     logger.debug(f"User {user} is deleting resource URI {uri}")
     await resource_service.delete_resource(db, uri)
 
+    form = await request.form()
+    is_inactive_checked = form.get("is_inactive_checked", "false")
     root_path = request.scope.get("root_path", "")
+
+    if is_inactive_checked.lower() == "true":
+        return RedirectResponse(f"{root_path}/admin/?include_inactive=true#resources", status_code=303)
     return RedirectResponse(f"{root_path}/admin#resources", status_code=303)
 
 
@@ -992,12 +1065,15 @@ async def admin_toggle_resource(
     logger.debug(f"User {user} is toggling resource ID {resource_id}")
     form = await request.form()
     activate = form.get("activate", "true").lower() == "true"
+    is_inactive_checked = form.get("is_inactive_checked", "false")
     try:
         await resource_service.toggle_resource_status(db, resource_id, activate)
     except Exception as e:
         logger.error(f"Error toggling resource status: {e}")
 
     root_path = request.scope.get("root_path", "")
+    if is_inactive_checked.lower() == "true":
+        return RedirectResponse(f"{root_path}/admin/?include_inactive=true#resources", status_code=303)
     return RedirectResponse(f"{root_path}/admin#resources", status_code=303)
 
 
@@ -1017,7 +1093,7 @@ async def admin_get_prompt(name: str, db: Session = Depends(get_db), user: str =
     prompt_details = await prompt_service.get_prompt_details(db, name)
 
     prompt = PromptRead.model_validate(prompt_details)
-    return prompt.dict(by_alias=True)
+    return prompt.model_dump(by_alias=True)
 
 
 @admin_router.post("/prompts")
@@ -1091,6 +1167,10 @@ async def admin_edit_prompt(
     await prompt_service.update_prompt(db, name, prompt)
 
     root_path = request.scope.get("root_path", "")
+    is_inactive_checked = form.get("is_inactive_checked", "false")
+
+    if is_inactive_checked.lower() == "true":
+        return RedirectResponse(f"{root_path}/admin/?include_inactive=true#prompts", status_code=303)
     return RedirectResponse(f"{root_path}/admin#prompts", status_code=303)
 
 
@@ -1116,7 +1196,12 @@ async def admin_delete_prompt(name: str, request: Request, db: Session = Depends
     logger.debug(f"User {user} is deleting prompt name {name}")
     await prompt_service.delete_prompt(db, name)
 
+    form = await request.form()
+    is_inactive_checked = form.get("is_inactive_checked", "false")
     root_path = request.scope.get("root_path", "")
+
+    if is_inactive_checked.lower() == "true":
+        return RedirectResponse(f"{root_path}/admin/?include_inactive=true#prompts", status_code=303)
     return RedirectResponse(f"{root_path}/admin#prompts", status_code=303)
 
 
@@ -1148,12 +1233,15 @@ async def admin_toggle_prompt(
     logger.debug(f"User {user} is toggling prompt ID {prompt_id}")
     form = await request.form()
     activate = form.get("activate", "true").lower() == "true"
+    is_inactive_checked = form.get("is_inactive_checked", "false")
     try:
         await prompt_service.toggle_prompt_status(db, prompt_id, activate)
     except Exception as e:
         logger.error(f"Error toggling prompt status: {e}")
 
     root_path = request.scope.get("root_path", "")
+    if is_inactive_checked.lower() == "true":
+        return RedirectResponse(f"{root_path}/admin/?include_inactive=true#prompts", status_code=303)
     return RedirectResponse(f"{root_path}/admin#prompts", status_code=303)
 
 
@@ -1203,7 +1291,12 @@ async def admin_delete_root(uri: str, request: Request, user: str = Depends(requ
     logger.debug(f"User {user} is deleting root URI {uri}")
     await root_service.remove_root(uri)
 
+    form = await request.form()
     root_path = request.scope.get("root_path", "")
+    is_inactive_checked = form.get("is_inactive_checked", "false")
+
+    if is_inactive_checked.lower() == "true":
+        return RedirectResponse(f"{root_path}/admin/?include_inactive=true#roots", status_code=303)
     return RedirectResponse(f"{root_path}/admin#roots", status_code=303)
 
 
@@ -1268,3 +1361,37 @@ async def admin_reset_metrics(db: Session = Depends(get_db), user: str = Depends
     await server_service.reset_metrics(db)
     await prompt_service.reset_metrics(db)
     return {"message": "All metrics reset successfully", "success": True}
+
+
+@admin_router.post("/gateways/test", response_model=GatewayTestResponse)
+async def admin_test_gateway(request: GatewayTestRequest, user: str = Depends(require_auth)) -> GatewayTestResponse:
+    """
+    Test a gateway by sending a request to its URL.
+    This endpoint allows administrators to test the connectivity and response
+
+    Args:
+        request (GatewayTestRequest): The request object containing the gateway URL and request details.
+        user (str): Authenticated user dependency.
+
+    Returns:
+        GatewayTestResponse: The response from the gateway, including status code, latency, and body
+    """
+    full_url = str(request.base_url).rstrip("/") + "/" + request.path.lstrip("/")
+    full_url = full_url.rstrip("/")
+    logger.debug(f"User {user} testing server at {request.base_url}.")
+    try:
+        start_time = time.monotonic()
+        async with ResilientHttpClient(client_args={"timeout": settings.federation_timeout, "verify": not settings.skip_ssl_verify}) as client:
+            response = await client.request(method=request.method.upper(), url=full_url, headers=request.headers, json=request.body)
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        try:
+            response_body: Union[dict, str] = response.json()
+        except json.JSONDecodeError:
+            response_body = {"details": response.text}
+
+        return GatewayTestResponse(status_code=response.status_code, latency_ms=latency_ms, body=response_body)
+
+    except httpx.RequestError as e:
+        logger.warning(f"Gateway test failed: {e}")
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        return GatewayTestResponse(status_code=502, latency_ms=latency_ms, body={"error": "Request failed", "details": str(e)})

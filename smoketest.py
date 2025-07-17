@@ -21,9 +21,12 @@ Usage:
   ./smoketest.py -v               Verbose (shows full logs)
 """
 
+# Future
 from __future__ import annotations
 
+# Standard
 import argparse
+from collections import deque
 import itertools
 import json
 import logging
@@ -33,12 +36,13 @@ import signal
 import socket
 import subprocess
 import sys
-import textwrap
 import threading
 import time
-from collections import deque
 from types import SimpleNamespace
 from typing import Callable, List, Tuple
+
+# First-Party
+from mcpgateway.config import settings
 
 # ───────────────────────── Ports / constants ────────────────────────────
 PORT_GATEWAY = 4444  # HTTPS container
@@ -55,7 +59,7 @@ SUPERGW_CMD = [
     "-y",
     "supergateway",
     "--stdio",
-    "uvenv run mcp_server_time -- --local-timezone=Europe/Dublin",
+    "uvx mcp_server_time -- --local-timezone=Europe/Dublin",
     "--port",
     str(PORT_TIME_SERVER),
 ]
@@ -66,7 +70,7 @@ def log_section(title: str, emoji: str = "⚙️"):
     logging.info("\n%s  %s\n%s", emoji, title, "─" * (len(title) + 4))
 
 
-# ───────────────────────── Tail‑N streaming runner ───────────────────────
+# ───────────────────────── Tail-N streaming runner ───────────────────────
 _spinner_cycle = itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 
 
@@ -134,7 +138,7 @@ def run_shell(
 
     globals()["_PREV_CMD_OUTPUT"] = "\n".join(full_buf)  # for show_last()
     status = "✅ PASS" if proc.returncode == 0 else "❌ FAIL"
-    logging.info("%s – %s", status, desc)
+    logging.info("%s - %s", status, desc)
     if proc.returncode and check:
         logging.error("↳ Last %d lines:\n%s", tail, "\n".join(tail_buf))
         raise subprocess.CalledProcessError(proc.returncode, cmd, output="\n".join(full_buf))
@@ -153,13 +157,14 @@ def port_open(port: int, host="127.0.0.1", timeout=1.0) -> bool:
         return s.connect_ex((host, port)) == 0
 
 
-def wait_http_ok(url: str, timeout: int = 30) -> bool:
+def wait_http_ok(url: str, timeout: int = 30, *, headers: dict | None = None) -> bool:
+    # Third-Party
     import requests
 
     end = time.time() + timeout
     while time.time() < end:
         try:
-            if requests.get(url, timeout=2, verify=False).status_code == 200:
+            if requests.get(url, timeout=2, verify=False, headers=headers).status_code == 200:
                 return True
         except requests.RequestException:
             pass
@@ -167,6 +172,7 @@ def wait_http_ok(url: str, timeout: int = 30) -> bool:
     return False
 
 
+# Third-Party
 # ───────────────────────────── Requests wrapper ──────────────────────────
 import urllib3
 
@@ -174,17 +180,33 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def generate_jwt() -> str:
-    return (
-        subprocess.check_output(
-            ["docker", "exec", DOCKER_CONTAINER, "python3", "-m", "mcpgateway.utils.create_jwt_token", "--username", "admin", "--exp", "300", "--secret", "my-test-key"],
-            text=True,
-        )
-        .strip()
-        .strip('"')
-    )
+    """
+    Create a short-lived admin JWT that matches the gateway's settings.
+    Resolution order → environment-variable override, then package defaults.
+    """
+    user = os.getenv("BASIC_AUTH_USER", "admin")
+    secret = os.getenv("JWT_SECRET_KEY", "my-test-key")
+    expiry = os.getenv("TOKEN_EXPIRY", "300")  # seconds
+
+    cmd = [
+        "docker",
+        "exec",
+        DOCKER_CONTAINER,
+        "python3",
+        "-m",
+        "mcpgateway.utils.create_jwt_token",
+        "--username",
+        user,
+        "--exp",
+        expiry,
+        "--secret",
+        secret,
+    ]
+    return subprocess.check_output(cmd, text=True).strip().strip('"')
 
 
 def request(method: str, path: str, *, json_data=None, **kw):
+    # Third-Party
     import requests
 
     token = generate_jwt()
@@ -238,11 +260,19 @@ def step_3_docker_build():
 
 def step_4_docker_run():
     sh(MAKE_DOCKER_RUN, "4️⃣  Run Docker container (HTTPS)")
-    # wait until gateway exposes the basic endpoints
+
+    # Build one token and reuse it for the health probes below.
+    token = generate_jwt()
+    auth_headers = {"Authorization": f"Bearer {token}"}
+
+    # Probe endpoints until they respond with 200.
     for ep in ("/health", "/ready", "/version"):
         full = f"https://localhost:{PORT_GATEWAY}{ep}"
-        if not wait_http_ok(full, 45):
+        need_auth = os.getenv("AUTH_REQUIRED", "true").lower() == "true"
+        headers = auth_headers if (ep == "/version" or need_auth) else None
+        if not wait_http_ok(full, 45, headers=headers):
             raise RuntimeError(f"Gateway endpoint {ep} not ready")
+
     logging.info("✅ Gateway /health /ready /version all OK")
 
 
@@ -258,15 +288,15 @@ def step_5_start_time_server(restart=False):
             except Exception as e:
                 logging.warning("Could not stop existing server: %s", e)
         else:
-            logging.info("ℹ️  Re‑using MCP‑Time‑Server on port %d", PORT_TIME_SERVER)
+            logging.info("ℹ️  Re-using MCP-Time-Server on port %d", PORT_TIME_SERVER)
     if not port_open(PORT_TIME_SERVER):
-        log_section("Launching MCP‑Time‑Server", "⏰")
+        log_section("Launching MCP-Time-Server", "⏰")
         _supergw_proc = subprocess.Popen(SUPERGW_CMD, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(20):
             if port_open(PORT_TIME_SERVER):
                 break
             if _supergw_proc.poll() is not None:
-                raise RuntimeError("Time‑Server exited")
+                raise RuntimeError("Time-Server exited")
             time.sleep(1)
 
 
@@ -281,7 +311,7 @@ def step_6_register_gateway() -> int:
     # 409 conflict → find existing
     if r.status_code == 409:
         gw = next(g for g in request("GET", "/gateways").json() if g["name"] == payload["name"])
-        logging.info("ℹ️  Gateway already present – using ID %s", gw["id"])
+        logging.info("ℹ️  Gateway already present - using ID %s", gw["id"])
         return gw["id"]
     # other error
     msg = r.text
@@ -294,12 +324,12 @@ def step_6_register_gateway() -> int:
 
 def step_7_verify_tools():
     names = [t["name"] for t in request("GET", "/tools").json()]
-    assert "get_current_time" in names, "get_current_time absent"
+    assert f"smoketest-time-server{settings.gateway_tool_name_separator}get-current-time" in names, f"smoketest-time-server{settings.gateway_tool_name_separator}get-current-time absent"
     logging.info("✅ Tool visible in /tools")
 
 
 def step_8_invoke_tool():
-    body = {"jsonrpc": "2.0", "id": 1, "method": "get_current_time", "params": {"timezone": "Europe/Dublin"}}
+    body = {"jsonrpc": "2.0", "id": 1, "method": "smoketest-time-server-get-current-time", "params": {"timezone": "Europe/Dublin"}}
     j = request("POST", "/rpc", json_data=body).json()
 
     if "error" in j:
@@ -318,7 +348,7 @@ def step_9_version_health():
     health = request("GET", "/health").json()["status"].lower()
     assert health in ("ok", "healthy"), f"Unexpected health status: {health}"
     ver = request("GET", "/version").json()["app"]["name"]
-    logging.info("✅ Health OK – app %s", ver)
+    logging.info("✅ Health OK - app %s", ver)
 
 
 def step_10_cleanup_gateway(gid: int | None = None):
@@ -349,12 +379,12 @@ STEPS: List[Tuple[str, StepFunc]] = [
 
 # ──────────────────────────────── Main ───────────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description="MCP Gateway smoke‑test")
+    ap = argparse.ArgumentParser(description="MCP Gateway smoke-test")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--tail", type=int, default=10, help="Tail window (default 10)")
     ap.add_argument("--start-step", type=int, default=1)
     ap.add_argument("--end-step", type=int)
-    ap.add_argument("--only-steps", help="Comma separated indices (1‑based)")
+    ap.add_argument("--only-steps", help="Comma separated indices (1-based)")
     ap.add_argument("--cleanup-only", action="store_true")
     ap.add_argument("--restart-time-server", action="store_true")
     args = ap.parse_args()
@@ -385,14 +415,14 @@ def main():
 
     try:
         for no, (name, fn) in enumerate(sel, 1):
-            logging.info("\n🔸 Step %s/%s — %s", no, len(sel), name)
+            logging.info("\n🔸 Step %s/%s - %s", no, len(sel), name)
             if name == "start_time_server":
                 fn(args.restart_time_server)  # type: ignore[arg-type]
             elif name == "register_gateway":
                 gid = fn()  # type: ignore[func-returns-value]
             elif name == "cleanup_gateway":
                 if gid is None:
-                    logging.warning("🧹  Skipping gateway‐deletion: no gateway was ever registered")
+                    logging.warning("🧹  Skipping gateway-deletion: no gateway was ever registered")
                 else:
                     fn(gid)  # type: ignore[arg-type]
             else:

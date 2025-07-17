@@ -25,13 +25,14 @@ Structure:
 - Provides OpenAPI metadata and redirect handling depending on UI feature flags.
 """
 
+# Standard
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
-from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
-import httpx
+# Third-Party
 from fastapi import (
     APIRouter,
     Body,
@@ -39,25 +40,37 @@ from fastapi import (
     FastAPI,
     HTTPException,
     Request,
+    status,
     WebSocket,
     WebSocketDisconnect,
-    status,
 )
 from fastapi.background import BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import ValidationError
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
 
+# First-Party
 from mcpgateway import __version__
 from mcpgateway.admin import admin_router
+from mcpgateway.bootstrap_db import main as bootstrap_db
 from mcpgateway.cache import ResourceCache, SessionRegistry
 from mcpgateway.config import jsonpath_modifier, settings
-from mcpgateway.db import Base, SessionLocal, engine
+from mcpgateway.db import refresh_slugs_on_startup, SessionLocal
 from mcpgateway.handlers.sampling import SamplingHandler
+from mcpgateway.models import (
+    InitializeRequest,
+    InitializeResult,
+    ListResourceTemplatesResult,
+    LogLevel,
+    ResourceContent,
+    Root,
+)
 from mcpgateway.schemas import (
     GatewayCreate,
     GatewayRead,
@@ -108,14 +121,10 @@ from mcpgateway.transports.streamablehttp_transport import (
     SessionManagerWrapper,
     streamable_http_auth,
 )
-from mcpgateway.types import (
-    InitializeRequest,
-    InitializeResult,
-    ListResourceTemplatesResult,
-    LogLevel,
-    ResourceContent,
-    Root,
-)
+from mcpgateway.utils.db_isready import wait_for_db_ready
+from mcpgateway.utils.error_formatter import ErrorFormatter
+from mcpgateway.utils.redis_isready import wait_for_redis_ready
+from mcpgateway.utils.retry_manager import ResilientHttpClient
 from mcpgateway.utils.verify_credentials import require_auth, require_auth_override
 from mcpgateway.validation.jsonrpc import (
     JSONRPCError,
@@ -135,8 +144,17 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
+# Wait for database to be ready before creating tables
+wait_for_db_ready(max_tries=int(settings.db_max_retries), interval=int(settings.db_retry_interval_ms) / 1000, sync=True)  # Converting ms to s
+
 # Create database tables
-Base.metadata.create_all(bind=engine)
+try:
+    loop = asyncio.get_running_loop()
+except RuntimeError:
+    asyncio.run(bootstrap_db())
+else:
+    loop.create_task(bootstrap_db())
+
 
 # Initialize services
 tool_service = ToolService()
@@ -151,6 +169,9 @@ server_service = ServerService()
 # Initialize session manager for Streamable HTTP transport
 streamable_http_session = SessionManagerWrapper()
 
+# Wait for redis to be ready
+if settings.cache_type == "redis":
+    wait_for_redis_ready(redis_url=settings.redis_url, max_retries=int(settings.redis_max_retries), retry_interval_ms=int(settings.redis_retry_interval_ms), sync=True)
 
 # Initialize session registry
 session_registry = SessionRegistry(
@@ -198,6 +219,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await sampling_handler.initialize()
         await resource_cache.initialize()
         await streamable_http_session.initialize()
+        refresh_slugs_on_startup()
 
         logger.info("All services initialized successfully")
         yield
@@ -223,6 +245,73 @@ app = FastAPI(
     root_path=settings.app_root_path,
     lifespan=lifespan,
 )
+
+
+# Global exceptions handlers
+@app.exception_handler(ValidationError)
+async def validation_exception_handler(_request: Request, exc: ValidationError):
+    """Handle Pydantic validation errors globally.
+
+    Intercepts ValidationError exceptions raised anywhere in the application
+    and returns a properly formatted JSON error response with detailed
+    validation error information.
+
+    Args:
+        _request: The FastAPI request object that triggered the validation error.
+                  (Unused but required by FastAPI's exception handler interface)
+        exc: The Pydantic ValidationError exception containing validation
+             failure details.
+
+    Returns:
+        JSONResponse: A 422 Unprocessable Entity response with formatted
+                      validation error details.
+
+    Examples:
+        >>> # This handler is automatically invoked by FastAPI when a ValidationError occurs
+        >>> # For example, when request data fails Pydantic model validation:
+        >>> # POST /tools with invalid data would trigger this handler
+        >>> # Response format:
+        >>> # {
+        >>> #   "detail": [
+        >>> #     {
+        >>> #       "loc": ["body", "name"],
+        >>> #       "msg": "field required",
+        >>> #       "type": "value_error.missing"
+        >>> #     }
+        >>> #   ]
+        >>> # }
+    """
+    return JSONResponse(status_code=422, content=ErrorFormatter.format_validation_error(exc))
+
+
+@app.exception_handler(IntegrityError)
+async def database_exception_handler(_request: Request, exc: IntegrityError):
+    """Handle SQLAlchemy database integrity constraint violations globally.
+
+    Intercepts IntegrityError exceptions (e.g., unique constraint violations,
+    foreign key constraints) and returns a properly formatted JSON error response.
+    This provides consistent error handling for database constraint violations
+    across the entire application.
+
+    Args:
+        _request: The FastAPI request object that triggered the database error.
+                  (Unused but required by FastAPI's exception handler interface)
+        exc: The SQLAlchemy IntegrityError exception containing constraint
+             violation details.
+
+    Returns:
+        JSONResponse: A 409 Conflict response with formatted database error details.
+
+    Examples:
+        >>> # This handler is automatically invoked when database constraints are violated
+        >>> # For example, trying to create a duplicate tool name:
+        >>> # POST /tools with duplicate name would trigger this handler
+        >>> # Response format:
+        >>> # {
+        >>> #   "detail": "Unique constraint violation: Key (name)=(existing_tool) already exists"
+        >>> # }
+    """
+    return JSONResponse(status_code=409, content=ErrorFormatter.format_database_error(exc))
 
 
 class DocsAuthMiddleware(BaseHTTPMiddleware):
@@ -272,14 +361,14 @@ class MCPPathRewriteMiddleware:
     - All other requests are passed through without change.
     """
 
-    def __init__(self, app):
+    def __init__(self, application):
         """
         Initialize the middleware with the ASGI application.
 
         Args:
-            app (Callable): The next ASGI application in the middleware stack.
+            application (Callable): The next ASGI application in the middleware stack.
         """
-        self.app = app
+        self.application = application
 
     async def __call__(self, scope, receive, send):
         """
@@ -292,7 +381,7 @@ class MCPPathRewriteMiddleware:
         """
         # Only handle HTTP requests, HTTPS uses scope["type"] == "http" in ASGI
         if scope["type"] != "http":
-            await self.app(scope, receive, send)
+            await self.application(scope, receive, send)
             return
 
         # Call auth check first
@@ -307,7 +396,7 @@ class MCPPathRewriteMiddleware:
             scope["path"] = "/mcp"
             await streamable_http_session.handle_streamable_http(scope, receive, send)
             return
-        await self.app(scope, receive, send)
+        await self.application(scope, receive, send)
 
 
 # Configure CORS
@@ -400,9 +489,7 @@ async def invalidate_resource_cache(uri: Optional[str] = None) -> None:
         resource_cache.clear()
 
 
-#################
 # Protocol APIs #
-#################
 @protocol_router.post("/initialize")
 async def initialize(request: Request, user: str = Depends(require_auth)) -> InitializeResult:
     """
@@ -561,12 +648,12 @@ async def list_servers(
 
 
 @server_router.get("/{server_id}", response_model=ServerRead)
-async def get_server(server_id: int, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> ServerRead:
+async def get_server(server_id: str, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> ServerRead:
     """
     Retrieves a server by its ID.
 
     Args:
-        server_id (int): The ID of the server to retrieve.
+        server_id (str): The ID of the server to retrieve.
         db (Session): The database session used to interact with the data store.
         user (str): The authenticated user making the request.
 
@@ -615,7 +702,7 @@ async def create_server(
 
 @server_router.put("/{server_id}", response_model=ServerRead)
 async def update_server(
-    server_id: int,
+    server_id: str,
     server: ServerUpdate,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -624,7 +711,7 @@ async def update_server(
     Updates the information of an existing server.
 
     Args:
-        server_id (int): The ID of the server to update.
+        server_id (str): The ID of the server to update.
         server (ServerUpdate): The updated server data.
         db (Session): The database session used to interact with the data store.
         user (str): The authenticated user making the request.
@@ -648,7 +735,7 @@ async def update_server(
 
 @server_router.post("/{server_id}/toggle", response_model=ServerRead)
 async def toggle_server_status(
-    server_id: int,
+    server_id: str,
     activate: bool = True,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -657,7 +744,7 @@ async def toggle_server_status(
     Toggles the status of a server (activate or deactivate).
 
     Args:
-        server_id (int): The ID of the server to toggle.
+        server_id (str): The ID of the server to toggle.
         activate (bool): Whether to activate or deactivate the server.
         db (Session): The database session used to interact with the data store.
         user (str): The authenticated user making the request.
@@ -678,12 +765,12 @@ async def toggle_server_status(
 
 
 @server_router.delete("/{server_id}", response_model=Dict[str, str])
-async def delete_server(server_id: int, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> Dict[str, str]:
+async def delete_server(server_id: str, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> Dict[str, str]:
     """
     Deletes a server by its ID.
 
     Args:
-        server_id (int): The ID of the server to delete.
+        server_id (str): The ID of the server to delete.
         db (Session): The database session used to interact with the data store.
         user (str): The authenticated user making the request.
 
@@ -707,13 +794,13 @@ async def delete_server(server_id: int, db: Session = Depends(get_db), user: str
 
 
 @server_router.get("/{server_id}/sse")
-async def sse_endpoint(request: Request, server_id: int, user: str = Depends(require_auth)):
+async def sse_endpoint(request: Request, server_id: str, user: str = Depends(require_auth)):
     """
     Establishes a Server-Sent Events (SSE) connection for real-time updates about a server.
 
     Args:
         request (Request): The incoming request.
-        server_id (int): The ID of the server for which updates are received.
+        server_id (str): The ID of the server for which updates are received.
         user (str): The authenticated user making the request.
 
     Returns:
@@ -744,13 +831,13 @@ async def sse_endpoint(request: Request, server_id: int, user: str = Depends(req
 
 
 @server_router.post("/{server_id}/message")
-async def message_endpoint(request: Request, server_id: int, user: str = Depends(require_auth)):
+async def message_endpoint(request: Request, server_id: str, user: str = Depends(require_auth)):
     """
     Handles incoming messages for a specific server.
 
     Args:
         request (Request): The incoming message request.
-        server_id (int): The ID of the server receiving the message.
+        server_id (str): The ID of the server receiving the message.
         user (str): The authenticated user making the request.
 
     Returns:
@@ -786,7 +873,7 @@ async def message_endpoint(request: Request, server_id: int, user: str = Depends
 
 @server_router.get("/{server_id}/tools", response_model=List[ToolRead])
 async def server_get_tools(
-    server_id: int,
+    server_id: str,
     include_inactive: bool = False,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -799,7 +886,7 @@ async def server_get_tools(
     that have been deactivated but not deleted from the system.
 
     Args:
-        server_id (int): ID of the server
+        server_id (str): ID of the server
         include_inactive (bool): Whether to include inactive tools in the results.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
@@ -809,12 +896,12 @@ async def server_get_tools(
     """
     logger.debug(f"User: {user} has listed tools for the server_id: {server_id}")
     tools = await tool_service.list_server_tools(db, server_id=server_id, include_inactive=include_inactive)
-    return [tool.dict(by_alias=True) for tool in tools]
+    return [tool.model_dump(by_alias=True) for tool in tools]
 
 
 @server_router.get("/{server_id}/resources", response_model=List[ResourceRead])
 async def server_get_resources(
-    server_id: int,
+    server_id: str,
     include_inactive: bool = False,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -827,7 +914,7 @@ async def server_get_resources(
     to view or manage resources that have been deactivated but not deleted.
 
     Args:
-        server_id (int): ID of the server
+        server_id (str): ID of the server
         include_inactive (bool): Whether to include inactive resources in the results.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
@@ -837,12 +924,12 @@ async def server_get_resources(
     """
     logger.debug(f"User: {user} has listed resources for the server_id: {server_id}")
     resources = await resource_service.list_server_resources(db, server_id=server_id, include_inactive=include_inactive)
-    return [resource.dict(by_alias=True) for resource in resources]
+    return [resource.model_dump(by_alias=True) for resource in resources]
 
 
 @server_router.get("/{server_id}/prompts", response_model=List[PromptRead])
 async def server_get_prompts(
-    server_id: int,
+    server_id: str,
     include_inactive: bool = False,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -855,7 +942,7 @@ async def server_get_prompts(
     prompts that have been deactivated but not deleted from the system.
 
     Args:
-        server_id (int): ID of the server
+        server_id (str): ID of the server
         include_inactive (bool): Whether to include inactive prompts in the results.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
@@ -865,7 +952,7 @@ async def server_get_prompts(
     """
     logger.debug(f"User: {user} has listed prompts for the server_id: {server_id}")
     prompts = await prompt_service.list_server_prompts(db, server_id=server_id, include_inactive=include_inactive)
-    return [prompt.dict(by_alias=True) for prompt in prompts]
+    return [prompt.model_dump(by_alias=True) for prompt in prompts]
 
 
 #############
@@ -874,7 +961,7 @@ async def server_get_prompts(
 @tool_router.get("", response_model=Union[List[ToolRead], List[Dict], Dict, List])
 @tool_router.get("/", response_model=Union[List[ToolRead], List[Dict], Dict, List])
 async def list_tools(
-    cursor: Optional[str] = None,  # Add this parameter
+    cursor: Optional[str] = None,
     include_inactive: bool = False,
     db: Session = Depends(get_db),
     apijsonpath: JsonPathModifier = Body(None),
@@ -925,7 +1012,7 @@ async def create_tool(tool: ToolCreate, db: Session = Depends(get_db), user: str
         logger.debug(f"User {user} is creating a new tool")
         return await tool_service.register_tool(db, tool)
     except ToolNameConflictError as e:
-        if not e.is_active and e.tool_id:
+        if not e.enabled and e.tool_id:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Tool name already exists but is inactive. Consider activating it with ID: {e.tool_id}",
@@ -937,7 +1024,7 @@ async def create_tool(tool: ToolCreate, db: Session = Depends(get_db), user: str
 
 @tool_router.get("/{tool_id}", response_model=Union[ToolRead, Dict])
 async def get_tool(
-    tool_id: int,
+    tool_id: str,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
     apijsonpath: JsonPathModifier = Body(None),
@@ -973,7 +1060,7 @@ async def get_tool(
 
 @tool_router.put("/{tool_id}", response_model=ToolRead)
 async def update_tool(
-    tool_id: int,
+    tool_id: str,
     tool: ToolUpdate,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -982,7 +1069,7 @@ async def update_tool(
     Updates an existing tool with new data.
 
     Args:
-        tool_id (int): The ID of the tool to update.
+        tool_id (str): The ID of the tool to update.
         tool (ToolUpdate): The updated tool information.
         db (Session): The database session dependency.
         user (str): The authenticated user making the request.
@@ -1001,12 +1088,12 @@ async def update_tool(
 
 
 @tool_router.delete("/{tool_id}")
-async def delete_tool(tool_id: int, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> Dict[str, str]:
+async def delete_tool(tool_id: str, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> Dict[str, str]:
     """
     Permanently deletes a tool by ID.
 
     Args:
-        tool_id (int): The ID of the tool to delete.
+        tool_id (str): The ID of the tool to delete.
         db (Session): The database session dependency.
         user (str): The authenticated user making the request.
 
@@ -1026,7 +1113,7 @@ async def delete_tool(tool_id: int, db: Session = Depends(get_db), user: str = D
 
 @tool_router.post("/{tool_id}/toggle")
 async def toggle_tool_status(
-    tool_id: int,
+    tool_id: str,
     activate: bool = True,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -1035,7 +1122,7 @@ async def toggle_tool_status(
     Activates or deactivates a tool.
 
     Args:
-        tool_id (int): The ID of the tool to toggle.
+        tool_id (str): The ID of the tool to toggle.
         activate (bool): Whether to activate (`True`) or deactivate (`False`) the tool.
         db (Session): The database session dependency.
         user (str): The authenticated user making the request.
@@ -1048,7 +1135,7 @@ async def toggle_tool_status(
     """
     try:
         logger.debug(f"User {user} is toggling tool with ID {tool_id} to {'active' if activate else 'inactive'}")
-        tool = await tool_service.toggle_tool_status(db, tool_id, activate)
+        tool = await tool_service.toggle_tool_status(db, tool_id, activate, reachable=activate)
         return {
             "status": "success",
             "message": f"Tool {tool_id} {'activated' if activate else 'deactivated'}",
@@ -1120,7 +1207,7 @@ async def toggle_resource_status(
 @resource_router.get("", response_model=List[ResourceRead])
 @resource_router.get("/", response_model=List[ResourceRead])
 async def list_resources(
-    cursor: Optional[str] = None,  # Add this parameter
+    cursor: Optional[str] = None,
     include_inactive: bool = False,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -1356,11 +1443,11 @@ async def create_prompt(
         user (str): Authenticated username.
 
     Returns:
-        PromptRead: The newly–created prompt.
+        PromptRead: The newly-created prompt.
 
     Raises:
-        HTTPException: * **409 Conflict** – another prompt with the same name already exists.
-            * **400 Bad Request** – validation or persistence error raised
+        HTTPException: * **409 Conflict** - another prompt with the same name already exists.
+            * **400 Bad Request** - validation or persistence error raised
                 by :pyclass:`~mcpgateway.services.prompt_service.PromptService`.
     """
     logger.debug(f"User: {user} requested to create prompt: {prompt}")
@@ -1440,8 +1527,8 @@ async def update_prompt(
         PromptRead: The updated prompt object.
 
     Raises:
-        HTTPException: * **409 Conflict** – a different prompt with the same *name* already exists and is still active.
-            * **400 Bad Request** – validation or persistence error raised by :pyclass:`~mcpgateway.services.prompt_service.PromptService`.
+        HTTPException: * **409 Conflict** - a different prompt with the same *name* already exists and is still active.
+            * **400 Bad Request** - validation or persistence error raised by :pyclass:`~mcpgateway.services.prompt_service.PromptService`.
     """
     logger.debug(f"User: {user} requested to update prompt: {name} with data={prompt}")
     try:
@@ -1480,7 +1567,7 @@ async def delete_prompt(name: str, db: Session = Depends(get_db), user: str = De
 ################
 @gateway_router.post("/{gateway_id}/toggle")
 async def toggle_gateway_status(
-    gateway_id: int,
+    gateway_id: str,
     activate: bool = True,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -1489,7 +1576,7 @@ async def toggle_gateway_status(
     Toggle the activation status of a gateway.
 
     Args:
-        gateway_id (int): Numeric ID of the gateway to toggle.
+        gateway_id (str): String ID of the gateway to toggle.
         activate (bool): ``True`` to activate, ``False`` to deactivate.
         db (Session): Active SQLAlchemy session.
         user (str): Authenticated username.
@@ -1562,16 +1649,15 @@ async def register_gateway(
     except Exception as ex:
         if isinstance(ex, GatewayConnectionError):
             return JSONResponse(content={"message": "Unable to connect to gateway"}, status_code=502)
-        elif isinstance(ex, ValueError):
+        if isinstance(ex, ValueError):
             return JSONResponse(content={"message": "Unable to process input"}, status_code=400)
-        elif isinstance(ex, RuntimeError):
+        if isinstance(ex, RuntimeError):
             return JSONResponse(content={"message": "Error during execution"}, status_code=500)
-        else:
-            return JSONResponse(content={"message": "Unexpected error"}, status_code=500)
+        return JSONResponse(content={"message": "Unexpected error"}, status_code=500)
 
 
 @gateway_router.get("/{gateway_id}", response_model=GatewayRead)
-async def get_gateway(gateway_id: int, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> GatewayRead:
+async def get_gateway(gateway_id: str, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> GatewayRead:
     """
     Retrieve a gateway by ID.
 
@@ -1589,7 +1675,7 @@ async def get_gateway(gateway_id: int, db: Session = Depends(get_db), user: str 
 
 @gateway_router.put("/{gateway_id}", response_model=GatewayRead)
 async def update_gateway(
-    gateway_id: int,
+    gateway_id: str,
     gateway: GatewayUpdate,
     db: Session = Depends(get_db),
     user: str = Depends(require_auth),
@@ -1611,7 +1697,7 @@ async def update_gateway(
 
 
 @gateway_router.delete("/{gateway_id}")
-async def delete_gateway(gateway_id: int, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> Dict[str, str]:
+async def delete_gateway(gateway_id: str, db: Session = Depends(get_db), user: str = Depends(require_auth)) -> Dict[str, str]:
     """
     Delete a gateway by ID.
 
@@ -1652,7 +1738,7 @@ async def list_roots(
 @root_router.post("", response_model=Root)
 @root_router.post("/", response_model=Root)
 async def add_root(
-    root: Root,  # Accept JSON body using the Root model from types.py
+    root: Root,  # Accept JSON body using the Root model from models.py
     user: str = Depends(require_auth),
 ) -> Root:
     """
@@ -1771,7 +1857,7 @@ async def handle_rpc(request: Request, db: Session = Depends(get_db), user: str 
             result = {}
         else:
             try:
-                result = await tool_service.invoke_tool(db, method, params)
+                result = await tool_service.invoke_tool(db=db, name=method, arguments=params)
                 if hasattr(result, "model_dump"):
                     result = result.model_dump(by_alias=True, exclude_none=True)
             except ValueError:
@@ -1809,7 +1895,8 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             try:
                 data = await websocket.receive_text()
-                async with httpx.AsyncClient(timeout=settings.federation_timeout, verify=not settings.skip_ssl_verify) as client:
+                client_args = {"timeout": settings.federation_timeout, "verify": not settings.skip_ssl_verify}
+                async with ResilientHttpClient(client_args=client_args) as client:
                     response = await client.post(
                         f"http://localhost:{settings.port}/rpc",
                         json=json.loads(data),
@@ -1891,8 +1978,8 @@ async def utility_message_endpoint(request: Request, user: str = Depends(require
         JSONResponse: ``{"status": "success"}`` with HTTP 202 on success.
 
     Raises:
-        HTTPException: * **400 Bad Request** – ``session_id`` query parameter is missing or the payload cannot be parsed as JSON.
-            * **500 Internal Server Error** – An unexpected error occurs while broadcasting the message.
+        HTTPException: * **400 Bad Request** - ``session_id`` query parameter is missing or the payload cannot be parsed as JSON.
+            * **500 Internal Server Error** - An unexpected error occurs while broadcasting the message.
     """
     try:
         logger.debug("User %s sent a message to SSE session", user)
@@ -2096,7 +2183,7 @@ if UI_ENABLED:
         logger.info("Static assets served from %s", settings.static_dir)
     except RuntimeError as exc:
         logger.warning(
-            "Static dir %s not found – Admin UI disabled (%s)",
+            "Static dir %s not found - Admin UI disabled (%s)",
             settings.static_dir,
             exc,
         )
@@ -2138,7 +2225,7 @@ else:
             dict: API info with app name, version, and UI/admin API status.
         """
         logger.info("UI disabled, serving API info at root path")
-        return {"name": settings.app_name, "version": "1.0.0", "description": f"{settings.app_name} API - UI is disabled", "ui_enabled": False, "admin_api_enabled": ADMIN_API_ENABLED}
+        return {"name": settings.app_name, "version": __version__, "description": f"{settings.app_name} API - UI is disabled", "ui_enabled": False, "admin_api_enabled": ADMIN_API_ENABLED}
 
 
 # Expose some endpoints at the root level as well
