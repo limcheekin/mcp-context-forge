@@ -23,6 +23,7 @@ services:
 
     # ──────────────────────────────────────────────────────────────────────
     # Environment – pick ONE database URL line, comment the rest
+    # https://github.com/limcheekin/mcp-context-forge/blob/main/.env.example
     # ──────────────────────────────────────────────────────────────────────
     environment:
       - HOST=0.0.0.0
@@ -33,6 +34,8 @@ services:
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:-changeme}
       - BASIC_AUTH_USER=${BASIC_AUTH_USER:-admin}
       - BASIC_AUTH_PASSWORD=${BASIC_AUTH_PASSWORD:-changeme}
+      - MCPGATEWAY_UI_ENABLED=${MCPGATEWAY_UI_ENABLED:-false}
+      - MCPGATEWAY_ADMIN_API_ENABLED=${MCPGATEWAY_ADMIN_API_ENABLED:-false}      
       # - SSL=true
       # - CERT_FILE=/app/certs/cert.pem
       # - KEY_FILE=/app/certs/key.pem
