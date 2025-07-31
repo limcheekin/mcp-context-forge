@@ -111,17 +111,6 @@ services:
       # - RI_SERVER_TLS_KEY=/certs/tls.key
       # - RI_SERVER_TLS_CERT=/certs/tls.crt
 
-  mcposerver:
-    ports:
-      - '10001:8000'    
-    command: ["--config", "/app/conf/config.json"]
-    build:
-      context: ./mcpo
-    image: mcpo-context-forge:latest  
-    restart: unless-stopped
-    volumes:
-      - /home/limcheekin/docker/volumes/mcposerver/conf:/app/conf:ro
-
 # Create user/pass in postgres
 # CREATE ROLE mcp WITH LOGIN PASSWORD 'your_secure_password';
 # CREATE DATABASE mcp OWNER mcp;
